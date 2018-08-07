@@ -1,99 +1,118 @@
-import discord, datetime, bisect
+import discord, datetime, bisect, copy
 from discord.ext import commands
+from pymongo import MongoClient
 
 __python__ = 3.6
 __author__ = "Meeow" + "github.com/meeow"
-__version__ = "Alpha" + "https://github.com/meeow/eventbot"
+__version__ = "Alpha with MongoDB" + "https://github.com/meeow/eventbot"
+bot_token = #insert here
 
+
+# ==== Database Logic ====
+client = MongoClient()
+db = client.events
+events = db.events
 
 # ==== Internal Logic ====
 
-events = []
-attendance = {}
+#events = {}
+statuses = ["Attending", "Not attending", "Undecided"]
+
+# string name: name of event to search for
+def event_exists(name):
+    return bool(events.find({"Name": name}).limit(1).count())
 
 # string name: name of event to create
 # string date: date in mm/dd format 
 # string mil_time: time in 24 hr format
 # string description: descrption of event
-def new_event(name, date, mil_time, description='No description.'):
+def new_event(name, author, date, mil_time, description='No description.'):
     global events
 
-    if name in attendance:
+    if event_exists(name):
         return name + " already exists in upcoming events."
 
     time_format = '%m/%d-%H:%M'
     time = datetime.datetime.strptime(date + '-' + mil_time, time_format)
 
-    new_event = [time, name, description]
+    event = {}
+    event["Name"] = name
+    event["Author"] = author
+    event["Time"] = time
+    event["Description"] = description
+    for status in statuses:
+        event[status] = []
 
-    bisect.insort(events, new_event)
-    attendance[name] = {}
+    result = events.insert_one(event)
+    print (result)
 
     msg = pprint_event(name) + pprint_attendance_instructions()
 
     return msg 
 
+def delete_event(name):
+    global events
+
+    result = events.remove({"Name": name})
+    print (result)
+
+    msg = "Successfully deleted {}.".format(name)
+    return msg
+
+
 # string name: name of event to get attendance of
 def get_attendance(name):
-    global attendance
+    global events
 
-    msg = ''
-    if name not in attendance:
+    if name not in events:
         return 'Unknown event name.'
         
-    status = {}
-    status['Attending'] = []
-    status['Not attending'] = []
-    status['Undecided'] = []
+    msg = ''
+    attendance = {}
+    for status in statuses:
+        attendance[status] = events[name][status]
 
-    for user in attendance[name]:
-        if attendance[name][user] == "Attending":
-            status['Attending'] += [user]
-        elif attendance[name][user] == "Not attending":
-            status['Not attending'] += [user]
-        elif attendance[name][user] == "Undecided":
-            status['Undecided'] += [user]
-
-    return status
+    return attendance
 
 # string name: name of event to pretty print
 def pprint_event(name):
     global events
 
-    if name not in events:
+    if event_exists(name) == False:
         return "No event named {} found.".format(name)
 
-    event = [_ for _ in events if _[1] == name][0]
+    event = events.find_one({'Name': name})
 
-    time = event[0].strftime("%A %-m/%-d %-I:%M%p")
-    description = event[2]
-    status = get_attendance(name)
+    time = event["Time"].strftime("%A %-m/%-d %-I:%M%p")
+    description = event["Description"]
+    author = event["Author"]
 
-    num_attending = len(status['Attending'])
-    num_not_attending = len(status['Not attending'])
-    num_undecided = len(status['Undecided'])
+    num_attending = len(event['Attending'])
+    num_not_attending = len(event['Not attending'])
+    num_undecided = len(event['Undecided'])
 
-    for k in status.keys():
-        if not status[k]:
-            status[k] = ['None yet!']
+    for s in statuses:
+        if not event[s]:
+            event[s] = ['None yet!']
 
-    attending = ', '.join(status['Attending'])
-    not_attending = ', '.join(status['Not attending'])
-    undecided = ', '.join(status['Undecided'])
+    attending = ', '.join(event['Attending'])
+    not_attending = ', '.join(event['Not attending'])
+    undecided = ', '.join(event['Undecided'])
 
     msg = '''
 **{}**
 **Time:** {}
+**Scheduled By:** {}
 **Description:** {}
 **Attending ({}):** {}
 **Not attending ({}):** {}
 **Undecided ({}):** {}
-'''.format(name, time, description, num_attending, attending, num_not_attending, not_attending, num_undecided, undecided)
+'''.format(name, time, author, description, num_attending, attending, num_not_attending, not_attending, num_undecided, undecided)
 
     return msg
 
 def pprint_attendance_instructions():
-    msg = '''\nIndicate or change your attendance plans by reacting to this message.
+    msg = '''\n**Update your attendance plans by reacting to this message**.
 😃: Attending
 😦: Not attending
 🤔: Undecided
@@ -104,25 +123,55 @@ def get_events():
     global events
 
     msg = ''
-    if events == []:
-        msg = 'No upcoming events.'
-    else:
-        for event in events:
-            msg += pprint_event(event[1])
 
+    cursor = events.find({})
+    for event in cursor:
+        msg += pprint_event(event['Name'])
+
+    if msg == '':
+        msg = 'No upcoming events.'
+    
     return msg
 
+def update_field(id, key, value):
+    result = events.update_one(
+    {
+        '_id': id
+    },
+    {
+        '$set': 
+        {
+            key: value
+        }
+    }, upsert=False)
+
+    return result
 
 # string event_name: name of event to change status of
 # string user_name: name of user to change status of
 # string status: new status
 def change_attendance(event_name, user_name, status):
-    global attendance
+    global events, statuses
 
-    if event_name not in attendance:
+    if not event_exists(event_name):
         return 'Unknown event name: {}'.format(event_name)
     
-    attendance[event_name][user_name] = status
+    event = events.find_one({'Name': event_name})
+    event_id = event['_id']
+    attendance_status = event[status] + [user_name]
+
+    existing_status = ()
+    for s in statuses:
+        if user_name in event[s]:
+            event[s].remove(user_name)
+            existing_status = [s, event[s]]
+
+    if existing_status:
+        update_field(event_id, existing_status[0], existing_status[1])
+
+    result = update_field(event_id, status, attendance_status)
+
+    print (result)
 
     return "Set **{}'s** status to **{}** for **{}**.".format(user_name, status, event_name)
 
@@ -140,12 +189,19 @@ def emoji_to_status(emoji):
     return status
 
 
-
 # ==== User Interactions ====
 
 bot = commands.Bot(command_prefix='!')
+
 # Remove default help command
 bot.remove_command('help')
+
+@bot.event
+async def on_ready():
+    print('Logged in as')
+    print(bot.user.name)
+    print(bot.user.id)
+    print('------')
 
 @bot.event
 async def on_reaction_add(reaction, user):
@@ -160,49 +216,54 @@ async def on_reaction_add(reaction, user):
 
     await channel.send(msg)
 
-@bot.event
-async def on_ready():
-    print('Logged in as')
-    print(bot.user.name)
-    print(bot.user.id)
-    print('------')
+# Commands
 
 @bot.command()
-async def show_events(ctx):
+async def show_all(ctx):
     msg = get_events()
     await ctx.send(msg)
 
 @bot.command()
 async def schedule(ctx, name, date, mil_time, description='No description.'):
-    msg = new_event(name, date, mil_time, description)
+    msg = new_event(name, ctx.message.author.name, date, mil_time, description)
     await ctx.send(msg)
 
 @bot.command()
-async def show_event(ctx, *, name):
+async def remove(ctx, name):
+    msg = delete_event(name)
+    await ctx.send(msg)
+
+@bot.command()
+async def show(ctx, *, name):
     global events
     name = name.strip('\"')
     msg = pprint_event(name)
 
-    if name in 
     await ctx.send(msg)
 
 @bot.command()
 async def help(ctx):
-    embed = discord.Embed(title="Schedule Bot", description="List of commands are:", color=0xeee657)
+    embed = discord.Embed(title="== eventbot ==", description="List of commands are:", color=0xeee657)
 
     embed.add_field(
         name="!schedule [name] [date (mm/dd)] [24-hr format time (hh:mm)] [description]", 
-        value='''Create a new event. Use quotes if your name or description parameter has spaces in it.''', 
+        value='''Create a new event. Use quotes if your name or description parameter has spaces in it.
+        Example: !schedule "Scrim against Shanghai Dragons" 4/20 16:20 "Descriptive description."''', 
         inline=False)
 
     embed.add_field(
-        name="!show_events", 
+        name="!show_all", 
         value="Show details for all upcoming events.", 
         inline=False)
 
     embed.add_field(
-        name="!show_event [event_name]", 
+        name="!show [event_name]", 
         value="Show details for the specified event.", 
+        inline=False)
+
+    embed.add_field(
+        name="!remove [event_name]", 
+        value="Delete the specified event.", 
         inline=False)
 
     await ctx.send(embed=embed)
@@ -214,10 +275,15 @@ async def dump_attendance(ctx):
     global attendance
     await ctx.send(attendance)
 
+@bot.command()
+async def dump_events(ctx):
+    global events
+    await ctx.send(events)
+
 
 # ==== Run Bot ====
 
-bot.run('NDU5NDcyMDAxMzI1ODU4ODE2.Dg2wxg.aH5XVCGT0bxRM1NjF2jVHW8e7qI')
+bot.run(bot_token)
 
 
 
