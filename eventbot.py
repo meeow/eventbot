@@ -1,21 +1,28 @@
 import discord, datetime, bisect, copy
 from discord.ext import commands
 from pymongo import MongoClient
+from os import environ
 
 __python__ = 3.6
 __author__ = "Meeow" + "github.com/meeow"
 __version__ = "Alpha with MongoDB" + "https://github.com/meeow/eventbot"
-bot_token =  "NDc2MDQyNjc3NDQwNDc5MjUy.Dkn1Lg.MfmEdFwfFkH8jw3ZjzkOP4O3EoM"#insert token
+bot_token =  environ['BOT_TOKEN'] 
 
+# print (environ)
 
-# ==== Database Logic ====
-client = MongoClient()
-db = client.events
+# ==== Database Setup ====
+mongo_uri = environ['MONGOURI']
+mlab_user = environ['MONGOUSER']
+mlab_pass = environ['MONGOPASS']
+
+client = MongoClient("ds018498.mlab.com", 18498)
+db = client.eventbot
+db.authenticate(mlab_user, mlab_pass)
 events = db.events
+
 
 # ==== Internal Logic ====
 
-#events = {}
 statuses = ["Attending", "Not attending", "Undecided"]
 
 # string name: name of event to search for
@@ -207,6 +214,8 @@ bot = commands.Bot(command_prefix='!')
 # Remove default help command
 bot.remove_command('help')
 
+# Events 
+
 @bot.event
 async def on_ready():
     print('Logged in as')
@@ -239,7 +248,7 @@ async def show_all(ctx):
 
 @bot.command()
 async def schedule(ctx, name, date, mil_time, description='No description.'):
-    msg = new_event(name, ctx.message.author.name, date, mil_time, description)
+    msg = new_event(name, ctx.message.author.name + '#' + ctx.message.author.discriminator, date, mil_time, description)
     await ctx.send(msg)
 
 @bot.command()
@@ -257,7 +266,7 @@ async def show(ctx, *, name):
 
 @bot.command()
 async def help(ctx):
-    embed = discord.Embed(title="== eventbot ==", description="List of commands are:", color=0xeee657)
+    embed = discord.Embed(title="== eventbot (by Meeow) ==", description="List of commands are:", color=0xeee657)
 
     embed.add_field(
         name="!schedule [name] [date (mm/dd)] [24-hr format time (hh:mm)] [description]", 
