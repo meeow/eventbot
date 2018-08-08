@@ -5,7 +5,7 @@ from pymongo import MongoClient
 __python__ = 3.6
 __author__ = "Meeow" + "github.com/meeow"
 __version__ = "Alpha with MongoDB" + "https://github.com/meeow/eventbot"
-bot_token =  #insert token
+bot_token =  "NDc2MDQyNjc3NDQwNDc5MjUy.Dkn1Lg.MfmEdFwfFkH8jw3ZjzkOP4O3EoM"#insert token
 
 
 # ==== Database Logic ====
