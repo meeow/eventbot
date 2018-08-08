@@ -5,7 +5,7 @@ from pymongo import MongoClient
 __python__ = 3.6
 __author__ = "Meeow" + "github.com/meeow"
 __version__ = "Alpha with MongoDB" + "https://github.com/meeow/eventbot"
-bot_token = #insert here
+bot_token =  #insert token
 
 
 # ==== Database Logic ====
@@ -22,6 +22,10 @@ statuses = ["Attending", "Not attending", "Undecided"]
 def event_exists(name):
     return bool(events.find({"Name": name}).limit(1).count())
 
+# datetime time: time to search for conflicts
+def time_exists(time):
+    return bool(events.find({"Time": time}).limit(1).count())
+
 # string name: name of event to create
 # string date: date in mm/dd format 
 # string mil_time: time in 24 hr format
@@ -32,8 +36,13 @@ def new_event(name, author, date, mil_time, description='No description.'):
     if event_exists(name):
         return name + " already exists in upcoming events."
 
-    time_format = '%m/%d-%H:%M'
-    time = datetime.datetime.strptime(date + '-' + mil_time, time_format)
+    year = str(datetime.datetime.now().year)
+
+    time_format = '%m/%d/%Y-%H:%M'
+    time = datetime.datetime.strptime(date + '/' + year + '-' + mil_time, time_format)
+
+    if time_exists(time):
+        return "There is already an event scheduled for {}".format(time.strftime("%A %-m/%-d %-I:%M%p"))
 
     event = {}
     event["Name"] = name
@@ -148,14 +157,16 @@ def update_field(id, key, value):
     return result
 
 # string event_name: name of event to change status of
-# string user_name: name of user to change status of
+# string user: username#discriminator of user to change status of
 # string status: new status
-def change_attendance(event_name, user_name, status):
+def change_attendance(event_name, user, status):
     global events, statuses
 
     if not event_exists(event_name):
         return 'Unknown event name: {}'.format(event_name)
     
+    user_name = "{}#{}".format(user.name, user.discriminator)
+
     event = events.find_one({'Name': event_name})
     event_id = event['_id']
     attendance_status = event[status] + [user_name]
@@ -205,16 +216,19 @@ async def on_ready():
 
 @bot.event
 async def on_reaction_add(reaction, user):
-    channel = reaction.message.channel
-    status = emoji_to_status(reaction.emoji)
-    event_name = reaction.message.content.splitlines()[0].replace('*','')
+    listen_to_reactions = "by reacting to this message" in reaction.message.content
 
-    if status == 'Unknown':
-        msg = 'Not a valid reaction option. Please try again using one of the specified emojis.'
-    else:  
-        msg = change_attendance(event_name, user.name, status)
+    if listen_to_reactions:
+        channel = reaction.message.channel
+        status = emoji_to_status(reaction.emoji)
+        event_name = reaction.message.content.splitlines()[0].replace('*','')
 
-    await channel.send(msg)
+        if status == 'Unknown':
+            msg = 'Not a valid reaction option. Please try again using one of the specified emojis.'
+        else:  
+            msg = change_attendance(event_name, user, status)
+
+        await channel.send(msg)
 
 # Commands
 
@@ -229,7 +243,7 @@ async def schedule(ctx, name, date, mil_time, description='No description.'):
     await ctx.send(msg)
 
 @bot.command()
-async def remove(ctx, name):
+async def remove(ctx, *, name):
     msg = delete_event(name)
     await ctx.send(msg)
 
@@ -237,7 +251,7 @@ async def remove(ctx, name):
 async def show(ctx, *, name):
     global events
     name = name.strip('\"')
-    msg = pprint_event(name)
+    msg = pprint_event(name) + pprint_attendance_instructions()
 
     await ctx.send(msg)
 
