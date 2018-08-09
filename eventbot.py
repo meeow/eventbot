@@ -1,4 +1,4 @@
-import discord, datetime, bisect, copy
+import discord, datetime
 from discord.ext import commands
 from pymongo import MongoClient
 from os import environ
@@ -8,10 +8,17 @@ __author__ = "Meeow" + "github.com/meeow"
 __version__ = "Alpha with MongoDB" + "https://github.com/meeow/eventbot"
 bot_token =  environ['BOT_TOKEN'] 
 
-# print (environ)
+# TODO:
+# - Add option to reschedule (edit time) existing events
+# - Add option to add player to existing event via command, not reaction
+# - Send reminders (DM or mentions) close to start time of event
+# - Unit tests
 
-# ==== Database Setup ====
-mongo_uri = environ['MONGOURI']
+# Nice to haves:
+# - Role permissions to call certain commands
+
+
+# ==== Database and Context Setup ====
 mlab_user = environ['MONGOUSER']
 mlab_pass = environ['MONGOPASS']
 
@@ -20,11 +27,9 @@ db = client.eventbot
 db.authenticate(mlab_user, mlab_pass)
 events = db.events
 
-
-# ==== Internal Logic ====
-
 statuses = ["Attending", "Not attending", "Undecided"]
 
+# ==== Helper Functions ====
 # string name: name of event to search for
 def event_exists(name):
     return bool(events.find({"Name": name}).limit(1).count())
@@ -33,6 +38,64 @@ def event_exists(name):
 def time_exists(time):
     return bool(events.find({"Time": time}).limit(1).count())
 
+# string name: name of event to return
+def get_event(name):
+    global events
+
+    event = events.find_one({'Name': name})
+    print ("Fetched " + str(event))
+
+    return event
+
+# string name: name of event to find id of
+def name_to_id(name):
+    event = events.find_one({'Name': name})
+    event_id = event['_id']
+    return event_id
+
+# User user: User object to convert to user.name + user.discriminator
+def user_to_username(user):
+    return "{}#{}".format(user.name, user.discriminator)
+
+# string emoji: reaction emoji from discord event
+def emoji_to_status(emoji):
+    status = 'Unknown'
+
+    if emoji in (':smiley:', '😃'):
+        status = 'Attending'
+    elif emoji in (':frowning:', '😦'):
+        status = 'Not attending'
+    elif emoji in (':thinking:', '🤔'):
+        status = 'Undecided'
+
+    return status
+
+def pprint_attendance_instructions():
+    msg = '''\n**Update your attendance plans by reacting to this message**.
+😃: Attending
+😦: Not attending
+🤔: Undecided
+    '''
+    return msg
+
+# int id: value of _id field of target mongodb document 
+# * key: name of field to update
+# * value: value to update field with
+def update_field(id, key, value):
+    result = events.update_one(
+    {
+        '_id': id
+    },
+    {
+        '$set': 
+        {
+            key: value
+        }
+    }, upsert=False)
+
+    return result
+
+# ==== Internal Logic ====
 # string name: name of event to create
 # string date: date in mm/dd format 
 # string mil_time: time in 24 hr format
@@ -66,38 +129,23 @@ def new_event(name, author, date, mil_time, description='No description.'):
 
     return msg 
 
+# string name: name of event to delete
 def delete_event(name):
     global events
 
     result = events.remove({"Name": name})
     print (result)
 
-    msg = "Successfully deleted {}.".format(name)
+    msg = "Successfully removed {}.".format(name)
     return msg
 
-
-# string name: name of event to get attendance of
-def get_attendance(name):
-    global events
-
-    if name not in events:
-        return 'Unknown event name.'
-        
-    msg = ''
-    attendance = {}
-    for status in statuses:
-        attendance[status] = events[name][status]
-
-    return attendance
-
 # string name: name of event to pretty print
-def pprint_event(name):
-    global events
-
+# bool verbose: print only name and time if False
+def pprint_event(name, verbose=True):
     if event_exists(name) == False:
         return "No event named {} found.".format(name)
 
-    event = events.find_one({'Name': name})
+    event = get_event(name)
 
     time = event["Time"].strftime("%A %-m/%-d %-I:%M%p")
     description = event["Description"]
@@ -115,53 +163,38 @@ def pprint_event(name):
     not_attending = ', '.join(event['Not attending'])
     undecided = ', '.join(event['Undecided'])
 
-    msg = '''
+    if verbose:
+        msg = '''
 **{}**
 **Time:** {}
-**Scheduled By:** {}
+**Author:** {}
 **Description:** {}
 **Attending ({}):** {}
 **Not attending ({}):** {}
 **Undecided ({}):** {}
-'''.format(name, time, author, description, num_attending, attending, num_not_attending, not_attending, num_undecided, undecided)
+'''.format(name, time, author, description, num_attending, attending, 
+    num_not_attending, not_attending, num_undecided, undecided)
+    else:
+        msg = '''
+**{}**
+**Time:** {}
+'''.format(name, time)
 
-    return msg
-
-def pprint_attendance_instructions():
-    msg = '''\n**Update your attendance plans by reacting to this message**.
-😃: Attending
-😦: Not attending
-🤔: Undecided
-    '''
     return msg
 
 def get_events():
     global events
 
-    msg = ''
+    msg = 'Showing all events. Use command `!show [event name]` for detailed info.\n'
 
     cursor = events.find({})
     for event in cursor:
-        msg += pprint_event(event['Name'])
+        msg += pprint_event(event['Name'], verbose=False)
 
     if msg == '':
         msg = 'No upcoming events.'
     
     return msg
-
-def update_field(id, key, value):
-    result = events.update_one(
-    {
-        '_id': id
-    },
-    {
-        '$set': 
-        {
-            key: value
-        }
-    }, upsert=False)
-
-    return result
 
 # string event_name: name of event to change status of
 # string user: username#discriminator of user to change status of
@@ -172,10 +205,13 @@ def change_attendance(event_name, user, status):
     if not event_exists(event_name):
         return 'Unknown event name: {}'.format(event_name)
     
-    user_name = "{}#{}".format(user.name, user.discriminator)
+    if not isinstance(user, str):
+        user_name = user_to_username(user)
+    else:
+        user_name = user
 
-    event = events.find_one({'Name': event_name})
-    event_id = event['_id']
+    event = get_event(event_name)
+    event_id = name_to_id(event_name)
     attendance_status = event[status] + [user_name]
 
     existing_status = ()
@@ -192,19 +228,6 @@ def change_attendance(event_name, user, status):
     print (result)
 
     return "Set **{}'s** status to **{}** for **{}**.".format(user_name, status, event_name)
-
-# string emoji: reaction emoji from discord event
-def emoji_to_status(emoji):
-    status = 'Unknown'
-
-    if emoji in (':smiley:', '😃'):
-        status = 'Attending'
-    elif emoji in (':frowning:', '😦'):
-        status = 'Not attending'
-    elif emoji in (':thinking:', '🤔'):
-        status = 'Undecided'
-
-    return status
 
 
 # ==== User Interactions ====
@@ -242,6 +265,12 @@ async def on_reaction_add(reaction, user):
 # Commands
 
 @bot.command()
+async def show(ctx, *, name):
+    name = name.strip('\"')
+    msg = pprint_event(name) + pprint_attendance_instructions()
+    await ctx.send(msg)
+
+@bot.command()
 async def show_all(ctx):
     msg = get_events()
     await ctx.send(msg)
@@ -256,11 +285,23 @@ async def remove(ctx, *, name):
     msg = delete_event(name)
     await ctx.send(msg)
 
+# User can change value of a field which is a string.
 @bot.command()
-async def show(ctx, *, name):
-    global events
-    name = name.strip('\"')
-    msg = pprint_event(name) + pprint_attendance_instructions()
+async def edit(ctx, name, key, value):
+    global events 
+
+    msg = ''
+    event_id = name_to_id(name)
+    event = get_event(name)
+
+    if not (event and event_id):
+        msg = 'Error: event name not found'        
+
+    if key in event and not isinstance(event[key], str):
+        msg = "Error: the specified field is not a string and cannot be changed using this command."
+    else:
+        update_field(event_id, key, value)
+        msg = "Set {} to {}.".format(key, value)
 
     await ctx.send(msg)
 
@@ -270,18 +311,19 @@ async def help(ctx):
 
     embed.add_field(
         name="!schedule [name] [date (mm/dd)] [24-hr format time (hh:mm)] [description]", 
-        value='''Create a new event. Use quotes if your name or description parameter has spaces in it.
+        value='''Create a new event. 
+        Use quotes if your name or description parameter has spaces in it.
         Example: !schedule "Scrim against Shanghai Dragons" 4/20 16:20 "Descriptive description."''', 
         inline=False)
 
     embed.add_field(
         name="!show_all", 
-        value="Show details for all upcoming events.", 
+        value="Show name and time for all upcoming events.", 
         inline=False)
 
     embed.add_field(
         name="!show [event_name]", 
-        value="Show details for the specified event.", 
+        value="Show all details for the specified event.", 
         inline=False)
 
     embed.add_field(
@@ -289,10 +331,17 @@ async def help(ctx):
         value="Delete the specified event.", 
         inline=False)
 
+    embed.add_field(
+        name="!edit [event_name] [field name] [new value]", 
+        value='''Edit field with a string type value (not dates or attendance lists).
+        Use quotes if your parameter has spaces in it.
+        Example: !edit "Scrim against Shanghai Dragons" "Description" "Improved description."''', 
+        inline=False)
+
     await ctx.send(embed=embed)
 
 
-# ==== Undocumented Commands for Debugging ====
+# ==== Undocumented Commands for Debugging/Admin Control ====
 @bot.command()
 async def dump_attendance(ctx):
     global attendance
@@ -303,6 +352,10 @@ async def dump_events(ctx):
     global events
     await ctx.send(events)
 
+@bot.command()
+async def change_attend(ctx, event_name, user_name, status):
+    msg = change_attendance(event_name, user_name, status)
+    await ctx.send(msg)
 
 # ==== Run Bot ====
 
