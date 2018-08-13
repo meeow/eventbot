@@ -5,7 +5,7 @@ from os import environ
 
 __python__ = 3.6
 __author__ = "Meeow" + "github.com/meeow"
-__version__ = "Alpha with MongoDB" + "https://github.com/meeow/eventbot"
+__version__ = "Beta" + "https://github.com/meeow/eventbot"
 bot_token =  environ['BOT_TOKEN'] 
 
 # TODO:
@@ -13,9 +13,13 @@ bot_token =  environ['BOT_TOKEN']
 # - Add option to add player to existing event via command, not reaction
 # - Send reminders (DM or mentions) close to start time of event
 # - Unit tests
+# - Prune stale events more gracefully
 
 # Nice to haves:
 # - Role permissions to call certain commands
+
+# Major feature history:
+# 8/10 - Add reschedule command
 
 
 # ==== Database and Context Setup ====
@@ -95,6 +99,18 @@ def update_field(id, key, value):
 
     return result
 
+# string date: date in mm/dd format 
+# string mil_time: time in 24 hr format
+def input_to_datetime(date, mil_time):
+    year = str(datetime.datetime.now().year)
+    time_format = '%m/%d/%Y-%H:%M'
+    time = datetime.datetime.strptime(date + '/' + year + '-' + mil_time, time_format)
+    return time
+
+# Datetime time: datetime object to convert to formatted string
+def pprint_time(time):
+    return time.strftime("%A %-m/%-d %-I:%M%p")
+
 # ==== Internal Logic ====
 # string name: name of event to create
 # string date: date in mm/dd format 
@@ -106,13 +122,10 @@ def new_event(name, author, date, mil_time, description='No description.'):
     if event_exists(name):
         return name + " already exists in upcoming events."
 
-    year = str(datetime.datetime.now().year)
-
-    time_format = '%m/%d/%Y-%H:%M'
-    time = datetime.datetime.strptime(date + '/' + year + '-' + mil_time, time_format)
+    time = input_to_datetime(date, mil_time)
 
     if time_exists(time):
-        return "There is already an event scheduled for {}".format(time.strftime("%A %-m/%-d %-I:%M%p"))
+        return "There is already an event scheduled for {}".format(pprint_time(time))
 
     event = {}
     event["Name"] = name
@@ -131,12 +144,11 @@ def new_event(name, author, date, mil_time, description='No description.'):
 
 # string name: name of event to delete
 def delete_event(name):
-    global events
-
-    result = events.remove({"Name": name})
-    print (result)
-
-    msg = "Successfully removed {}.".format(name)
+    if event_exists(name):
+        result = events.remove({"Name": name})
+        msg = "Removed {}.".format(name)
+    else:
+        msg = "Error: cannot find event called {}".format(name)
     return msg
 
 # string name: name of event to pretty print
@@ -147,7 +159,7 @@ def pprint_event(name, verbose=True):
 
     event = get_event(name)
 
-    time = event["Time"].strftime("%A %-m/%-d %-I:%M%p")
+    time = pprint_time(event["Time"])
     description = event["Description"]
     author = event["Author"]
 
@@ -225,8 +237,6 @@ def change_attendance(event_name, user, status):
 
     result = update_field(event_id, status, attendance_status)
 
-    print (result)
-
     return "Set **{}'s** status to **{}** for **{}**.".format(user_name, status, event_name)
 
 
@@ -281,24 +291,34 @@ async def schedule(ctx, name, date, mil_time, description='No description.'):
     await ctx.send(msg)
 
 @bot.command()
+async def reschedule(ctx, name, date, mil_time):
+    if not event_exists(name):
+        msg = "Error: Cannot find event called {}".format(name)
+    else:
+        event_id = name_to_id(name)
+        time = input_to_datetime(date, mil_time)
+        update_field(event_id, 'Time', time)
+        msg = "Set {} to {}.".format(name, pprint_time(time))
+    await ctx.send(msg)
+
+@bot.command()
 async def remove(ctx, *, name):
+    name = name.strip('\"')
     msg = delete_event(name)
     await ctx.send(msg)
 
 # User can change value of a field which is a string.
 @bot.command()
 async def edit(ctx, name, key, value):
-    global events 
-
     msg = ''
     event_id = name_to_id(name)
     event = get_event(name)
 
-    if not (event and event_id):
-        msg = 'Error: event name not found'        
+    if not event_exists(name):
+        msg += 'Error: Cannot find event called {}\n'.format(name)       
 
     if key in event and not isinstance(event[key], str):
-        msg = "Error: the specified field is not a string and cannot be changed using this command."
+        msg += "Error: the specified field is not a string and cannot be changed using this command."
     else:
         update_field(event_id, key, value)
         msg = "Set {} to {}.".format(key, value)
@@ -313,7 +333,14 @@ async def help(ctx):
         name="!schedule [name] [date (mm/dd)] [24-hr format time (hh:mm)] [description]", 
         value='''Create a new event. 
         Use quotes if your name or description parameter has spaces in it.
-        Example: !schedule "Scrim against Shanghai Dragons" 4/20 16:20 "Descriptive description."''', 
+        Example: !schedule "Scrim against Shanghai Dragons" 3/14 15:00 "Descriptive description."''', 
+        inline=False)
+
+    embed.add_field(
+        name="!reschedule [name] [date (mm/dd)] [24-hr format time (hh:mm)] ", 
+        value='''Edit the time of an existing event. 
+        Use quotes if your name or description parameter has spaces in it.
+        Example: !reschedule "Scrim against Shanghai Dragons" 4/1 13:30''', 
         inline=False)
 
     embed.add_field(
@@ -342,11 +369,6 @@ async def help(ctx):
 
 
 # ==== Undocumented Commands for Debugging/Admin Control ====
-@bot.command()
-async def dump_attendance(ctx):
-    global attendance
-    await ctx.send(attendance)
-
 @bot.command()
 async def dump_events(ctx):
     global events
