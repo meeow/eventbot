@@ -1,2 +1,4 @@
 git+https://github.com/Rapptz/discord.py@rewrite#egg=discord.py[voice]
 pymongo==3.7.1
+pytz==2017.2
+dateparser==0.7.0
