@@ -1,4 +1,4 @@
-import discord, datetime
+import discord, datetime, asyncio
 from discord.ext import commands
 from pymongo import MongoClient
 from bson.codec_options import CodecOptions
@@ -7,7 +7,6 @@ from os import environ
 
 from pytz import timezone
 from dateparser import parse
-
 
 __python__ = 3.6
 __author__ = "github.com/meeow" 
@@ -21,12 +20,14 @@ __version__ = "1.3" + "https://github.com/meeow/eventbot"
 
 # TODO:
 # - Send reminders (DM or mentions) close to start time of event
+# - Add way to unset reminders
+# - Add customization options via discord interface
 # - Unit tests
 
 # Nice to have:
 # - Role permissions to call certain commands
+# - Chronological order !show_all 
 
-# Bug list:
 
 # Version history:
 # - v1.1: Add unschedule_past command
@@ -42,6 +43,9 @@ __version__ = "1.3" + "https://github.com/meeow/eventbot"
 #       + Admin may edit or delete any events
 #       + Anyone may delete all past events
 #   * Make more error messages temporary
+# - v1.3.1 (heroku build 143)
+#   * Minor refactoring
+#   * Begin implementing reminders
 
 
 # ==== Database and Context Setup ====
@@ -57,16 +61,27 @@ db.authenticate(MLAB_USER, MLAB_PASS)
 
 EVENTS = db.events.with_options(codec_options=CodecOptions(tz_aware=True))
 
-# Bot config options
 
-ERR_MSG_DURATION = 5.0 # seconds before deleting error messages 
+# ==== Bot config options ====
+
+# Change seconds before deleting error messages 
+ERR_MSG_DURATION = 5.0 
 
 # Add more statuses to future events simply by changing this
 STATUSES = {"Yes":"😃", "Partly":"😐", "Maybe":"🤔", "No":"😦"}
 
+# Send reminders to users who indicated these statuses
+SEND_REMINDERS_TO = ['Yes', 'Partly', 'Maybe']
+# By default, send reminders for events this number of minutes before start time
+REMINDER_TIME = 20
+# Emoji used to issue a shortcut reminder request
+REMINDER_EMOJI = '⏰'
+
 BOT_TZ = timezone('America/New_York')
 
-ADMIN_ROLES = 1 # top 'x' number of roles allowed to perform admin commands
+# Top 'x' number of roles in the server's role hierarchy allowed to perform admin commands
+ADMIN_ROLES = 1 
+
 
 # ==== Helper Functions ====
 
@@ -92,8 +107,6 @@ def is_author(ctx, name):
 
 # discord.Context ctx: context of command which calls this function
 def pprint_insufficient_privileges(ctx):
-    #top_role = ctx.message.author.roles[-1].name
-    #msg = "Your role of {} is not high enough to perform this action.".format(top_role)
     msg = "Error: You have insufficient privileges to perform this action."
     return msg
 
@@ -132,7 +145,7 @@ def user_to_username(user):
 
 # string emoji: reaction emoji from discord event
 def emoji_to_status(emoji):
-    matched_status = 'Unknown'
+    matched_status = ''
     for status in STATUSES:
         if STATUSES[status] == emoji:
             matched_status = status
@@ -219,8 +232,12 @@ def new_event(name, author, date, time, description='No description.'):
     event["Author"] = author
     event["Time"] = time
     event["Description"] = description
+
     for status in STATUSES.keys():
         event[status] = []
+
+    # Intended to be hidden when printing
+    event["Metadata"] = {"Reminders": []}
 
     EVENTS.insert_one(event)
 
@@ -274,7 +291,9 @@ def pprint_event(name, verbose=True):
         elif field == "Time":
             msg += "**{}:** {}\n".format(field, pprint_time(val)) 
         elif verbose:
-            if field in STATUSES and isinstance(val, list):
+            if field == 'Metadata':
+                continue # do not show 
+            elif field in STATUSES and isinstance(val, list):
                 if val:
                     attendee_list = ', '.join(val)
                 else:
@@ -307,7 +326,7 @@ def pprint_all_events():
 # string event_name: name of event to change status of
 # string user: username#discriminator of user to change status of
 # string status: new status
-def change_attendance(event_name, user, status):
+def set_attendance(event_name, user, status):
     if not event_exists(event_name):
         return pprint_event_not_found(event_name)
     
@@ -318,7 +337,6 @@ def change_attendance(event_name, user, status):
 
     event = get_event(event_name)
     event_id = name_to_id(event_name)
-    attendance_status = event[status] + [user_name]
 
     old_status = []
     for s in STATUSES:
@@ -332,9 +350,41 @@ def change_attendance(event_name, user, status):
         update_field(event_id, old_status[0], old_status[1])
 
     if not old_status or (old_status and status != old_status[0]):
+        attendance_status = event[status] + [user_name]
         update_field(event_id, status, attendance_status)
 
     return "Set **{}'s** status to **{}** for **{}**.".format(user_name, status, event_name)
+
+
+# string event_name: name of event to set reminder for
+# string user: username#discriminator of user to set reminder for
+# int/float time: minutes before event begins to send reminders
+def set_reminder(event_name, user, time=REMINDER_TIME):
+    if not event_exists(event_name):
+        return pprint_event_not_found(event_name)
+    
+    if not isinstance(user, str):
+        user_name = user_to_username(user)
+    else:
+        user_name = user
+
+    event = get_event(event_name)
+    event_id = name_to_id(event_name)
+    new_reminder = (user_name, time)
+
+    metadata = event['Metadata']
+    metadata['Reminders'] += [new_reminder]
+
+    update_field(event_id, 'Metadata', metadata)
+    return "Set {} minutes reminder for **{}**.".format(time, event_name)
+
+
+
+
+# ==== Discord specific helper functions ====
+async def send_temp_message(ctx, msg):
+    temp_msg = await ctx.send(msg)
+    await temp_msg.edit(content=msg, delete_after=ERR_MSG_DURATION)
 
 
 # ==== User Interactions ====
@@ -343,6 +393,21 @@ bot = commands.Bot(command_prefix='!')
 
 # Remove default help command
 bot.remove_command('help')
+
+# Background tasks
+
+async def send_reminders():
+    await bot.wait_until_ready()
+
+    while not bot.is_closed:
+        cursor = EVENTS.find({})
+        for event in cursor:
+            for key in event.keys():
+                if key in SEND_REMINDERS_TO:
+                    assert(isinstance(event[key], list))
+
+
+
 
 # Events 
 
@@ -363,13 +428,15 @@ async def on_reaction_add(reaction, user):
         status = emoji_to_status(reaction.emoji)
         event_name = message.content.splitlines()[0].replace('*','')
 
-        if status == 'Unknown':
+        if reaction.emoji == REMINDER_EMOJI:
+            set_reminder(event_name, user)
+            await user.send("Got it! You should get a reminder for {} {} minutes before it starts. This feature is currently in beta, so try not to rely too heavily on it.".format(event_name, REMINDER_TIME))
+        elif not status:
             msg = '**Not a valid reaction option.** Please try again using one of the specified emojis.'
             err_message = await channel.send(msg)
             await err_message.edit(content=msg, delete_after=ERR_MSG_DURATION)
-
         else:  
-            change_attendance(event_name, user, status)
+            set_attendance(event_name, user, status)
             new_message = pprint_event(event_name) + pprint_attendance_instructions()
             await message.edit(content=new_message)
 
@@ -393,19 +460,18 @@ async def show_all(ctx):
 
 @bot.command()
 async def schedule(ctx, name, date, time, description='No description.'):
-    msg = new_event(name, ctx.message.author.name + '#' + ctx.message.author.discriminator, date, time, description)
+    discord_tag = ctx.message.author.name + '#' + ctx.message.author.discriminator
+    msg = new_event(name, discord_tag, date, time, description)
     await ctx.send(msg)
 
 @bot.command()
 async def reschedule(ctx, name, *, datetime):
     if not event_exists(name):
         msg = pprint_event_not_found(name)
-        err_msg = await ctx.send(msg)
-        await err_msg.edit(content=msg, delete_after=ERR_MSG_DURATION)
+        await send_temp_message(ctx, msg)
     elif not (is_admin(ctx) or is_author(ctx, name)):
         msg = pprint_insufficient_privileges(ctx)
-        err_msg = await ctx.send(msg)
-        await err_msg.edit(content=msg, delete_after=ERR_MSG_DURATION)
+        await send_temp_message(ctx, msg)
     else:
         event_id = name_to_id(name)
         time = input_to_datetime(datetime)
@@ -421,8 +487,7 @@ async def unschedule(ctx, *, name):
         await ctx.send(msg)
     else:
         msg = pprint_insufficient_privileges(ctx)
-        err_msg = await ctx.send(msg)
-        await err_msg.edit(content=msg, delete_after=ERR_MSG_DURATION)
+        await send_temp_message(ctx, msg)
 
 @bot.command()
 async def unschedule_past(ctx):
@@ -445,13 +510,11 @@ async def edit(ctx, name, key, value):
         (key == "Author" and not is_admin(ctx))
         ):
         msg += "Error: the specified field cannot be changed using this command or you do not have permission."
-        err_msg = await ctx.send(msg)
-        await err_msg.edit(content=msg, delete_after=ERR_MSG_DURATION)
+        await send_temp_message(ctx, msg)
     else:
         update_field(event_id, key, value)
         msg = "Set {} to {}.".format(key, value)
         await ctx.send(msg)
-
 
 
 # Custom help command
@@ -460,10 +523,10 @@ async def help(ctx):
     embed = discord.Embed(title="== eventbot (by Meeow) ==", description="List of commands are:", color=0xeee657)
 
     embed.add_field(
-        name="!schedule [name] [date (mm/dd)] [time (hh:mm)AM/PM] [description]", 
+        name="!schedule [name] [date (mm/dd)] [time] [description]", 
         value='''Create a new event. 
         Use quotes if your name or description parameter has spaces in it.
-        Example: !schedule "Scrim against SHD" "Descriptive description." 3/14 1:00PM PST''', 
+        Example: !schedule "Scrim against SHD" "Descriptive description." 3/14 1:00PM''', 
         inline=False)
 
     embed.add_field(
@@ -504,11 +567,12 @@ async def help(ctx):
     await ctx.send(embed=embed)
 
 
-# ==== Undocumented Commands for Debugging/Admin Control ====
+# ==== Undocumented Commands for Debugging/Admin ====
 @bot.command()
 async def set_attend(ctx, event_name, user_name, status):
-    msg = change_attendance(event_name, user_name, status)
-    await ctx.send(msg)
+    if is_admin(ctx):
+        msg = set_attendance(event_name, user_name, status)
+        await ctx.send(msg)
 
 @bot.command()
 async def factory(ctx, num_events=5):
@@ -538,6 +602,10 @@ async def dump_roles(ctx):
     for role in roles:
         print(role.name, ' - position', role.position)
     await ctx.send('Logged roles in console.')
+
+@bot.command()
+async def dm(ctx, *, msg):
+    await ctx.message.author.send(msg)
 
 # ==== Run Bot ====
 bot.run(BOT_TOKEN)
