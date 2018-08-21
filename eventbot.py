@@ -10,7 +10,7 @@ from dateparser import parse
 
 __python__ = 3.6
 __author__ = "github.com/meeow" 
-__version__ = "1.3" + "https://github.com/meeow/eventbot"
+__version__ = "1.4" + "https://github.com/meeow/eventbot"
 
 # Files in this repo:
 # - eventbot.py (this file!)
@@ -19,7 +19,8 @@ __version__ = "1.3" + "https://github.com/meeow/eventbot"
 # - README.md
 
 # TODO:
-# - Send reminders (DM or mentions) close to start time of event
+# - Add command to set custom time in advance to send reminder
+# - Add ability to send /tts reminders
 # - Add way to unset reminders
 # - Add customization options via discord interface
 # - Unit tests
@@ -28,9 +29,9 @@ __version__ = "1.3" + "https://github.com/meeow/eventbot"
 # - Role permissions to call certain commands
 # - Chronological order !show_all 
 
-
-# Version history:
-# - v1.1: Add unschedule_past command
+# Current version history:
+# - v1.1: 
+#   * Add unschedule_past command
 # - v1.2 (heroku build 121):  
 #   * Save datetimes as timezone aware in mongodb
 #   * More accurate datetime parsing and validations
@@ -46,7 +47,10 @@ __version__ = "1.3" + "https://github.com/meeow/eventbot"
 # - v1.3.1 (heroku build 143)
 #   * Minor refactoring
 #   * Begin implementing reminders
-
+# - v1.4 (heroku build 163)
+#   * Initial implementation of reminders
+#       + React with ⏰ emoji to receive a reminder DM 20 mins before start of event
+#       + Additional functionality coming soon
 
 # ==== Database and Context Setup ====
 
@@ -76,6 +80,8 @@ SEND_REMINDERS_TO = ['Yes', 'Partly', 'Maybe']
 REMINDER_TIME = 20
 # Emoji used to issue a shortcut reminder request
 REMINDER_EMOJI = '⏰'
+# Interval to check for reminders which need sending, in seconds
+REMINDER_CYCLE = 10
 
 BOT_TZ = timezone('America/New_York')
 
@@ -143,6 +149,13 @@ def get_utc_offset_hrs():
 def user_to_username(user):
     return "{}#{}".format(user.name, user.discriminator)
 
+# Client client: discord client in guild
+# string username: Return User object in guild matching username
+def username_to_user(client, username):
+    for user in client.users:
+        if user.name + '#' + user.discriminator == username:
+            return user
+
 # string emoji: reaction emoji from discord event
 def emoji_to_status(emoji):
     matched_status = ''
@@ -154,7 +167,8 @@ def emoji_to_status(emoji):
     return matched_status
 
 def pprint_attendance_instructions():
-    msg = '''*Update your status by reacting with the corresponding emoji.*'''
+    msg = '*Update your status by reacting with the corresponding emoji.*'
+    msg += '\n*Request a 20 minute heads-up via DM by additionally reacting* ' + REMINDER_EMOJI
     return msg
 
 # Datetime time: datetime object to convert to formatted string
@@ -237,7 +251,7 @@ def new_event(name, author, date, time, description='No description.'):
         event[status] = []
 
     # Intended to be hidden when printing
-    event["Metadata"] = {"Reminders": []}
+    event["Metadata"] = {"Reminders": {}}
 
     EVENTS.insert_one(event)
 
@@ -370,15 +384,20 @@ def set_reminder(event_name, user, time=REMINDER_TIME):
 
     event = get_event(event_name)
     event_id = name_to_id(event_name)
-    new_reminder = (user_name, time)
 
     metadata = event['Metadata']
-    metadata['Reminders'] += [new_reminder]
-
+    metadata['Reminders'][user_name] = time
+    
     update_field(event_id, 'Metadata', metadata)
     return "Set {} minutes reminder for **{}**.".format(time, event_name)
 
-
+# event: event entry in mongodb
+# string username: user.name#user.discriminator
+def delete_reminder(event, username):
+    event_id = name_to_id(event['Name'])
+    metadata = event['Metadata']
+    del metadata['Reminders'][username] 
+    update_field(event_id, 'Metadata', metadata)
 
 
 # ==== Discord specific helper functions ====
@@ -390,23 +409,28 @@ async def send_temp_message(ctx, msg):
 # ==== User Interactions ====
 
 bot = commands.Bot(command_prefix='!')
-
 # Remove default help command
 bot.remove_command('help')
+
 
 # Background tasks
 
 async def send_reminders():
     await bot.wait_until_ready()
 
-    while not bot.is_closed:
+    while 1:
         cursor = EVENTS.find({})
         for event in cursor:
-            for key in event.keys():
-                if key in SEND_REMINDERS_TO:
-                    assert(isinstance(event[key], list))
-
-
+            reminders = event['Metadata']['Reminders']
+            for user_name in list(event['Metadata']['Reminders'].keys()):
+                present = datetime.datetime.now(BOT_TZ)
+                if present + datetime.timedelta(minutes=reminders[user_name]) >= event['Time']:
+                    print("Sending reminder:", event['Name'], reminders)
+                    event_name = event["Name"]
+                    user = username_to_user(bot, user_name)
+                    await user.send("Hey! Your event {} is starting within {} minutes!".format(event['Name'], reminders[user_name]))
+                    delete_reminder(event, user_name)
+        await asyncio.sleep(REMINDER_CYCLE)
 
 
 # Events 
@@ -576,14 +600,17 @@ async def set_attend(ctx, event_name, user_name, status):
 
 @bot.command()
 async def factory(ctx, num_events=5):
-    msg = ''
-    for num in range(num_events):
-        num = num % 11
-        date = '9/{}'.format((num % 5) + 1)
-        time = str(1 + num) + ':00pm'
-        name = '-test' + date + time
+    if num_events > 9:
+        num_events = 9
 
+    for num in range(num_events):
+        date = '9/{}'.format(num+1)
+        time = str(1 + num) + ':00pm'
+        name = '-test' + str(num)
+        msg = new_event(name, ctx.message.author.name, date, time)
+        await ctx.send(msg)
         print ("Factory creating event on date {} at time {}".format(date, time))
+
     await ctx.send("Attempted to create {} test events".format(num_events))
 
 @bot.command()
@@ -603,11 +630,9 @@ async def dump_roles(ctx):
         print(role.name, ' - position', role.position)
     await ctx.send('Logged roles in console.')
 
-@bot.command()
-async def dm(ctx, *, msg):
-    await ctx.message.author.send(msg)
 
 # ==== Run Bot ====
+bot.loop.create_task(send_reminders())
 bot.run(BOT_TOKEN)
 
 
