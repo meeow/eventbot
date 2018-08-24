@@ -10,7 +10,7 @@ from dateparser import parse
 
 __python__ = 3.6
 __author__ = "github.com/meeow" 
-__version__ = "1.4" + "https://github.com/meeow/eventbot"
+__version__ = "1.4.2" + "https://github.com/meeow/eventbot"
 
 # Files in this repo:
 # - eventbot.py (this file!)
@@ -28,6 +28,10 @@ __version__ = "1.4" + "https://github.com/meeow/eventbot"
 # Nice to have:
 # - Role permissions to call certain commands
 # - Chronological order !show_all 
+# - Allow reactions to messages not in message cache
+
+# Warnings:
+# - May have unexpected behavior if another user reacts before the bot clears the previous user's reaction
 
 # Current version history:
 # - v1.1: 
@@ -51,6 +55,11 @@ __version__ = "1.4" + "https://github.com/meeow/eventbot"
 #   * Initial implementation of reminders
 #       + React with ⏰ emoji to receive a reminder DM 20 mins before start of event
 #       + Additional functionality coming soon
+# - v1.4.1 (heroku build 164)
+#   * Revised instructions to account for heroku dyno cycling clearing message cache
+# - v1.4.2 (heroku build 178)
+#   * Use raw reactions to handle reaction detection, if target message is not cached
+#   * Revise instructions to account for this bugfix
 
 # ==== Database and Context Setup ====
 
@@ -74,8 +83,6 @@ ERR_MSG_DURATION = 5.0
 # Add more statuses to future events simply by changing this
 STATUSES = {"Yes":"😃", "Partly":"😐", "Maybe":"🤔", "No":"😦"}
 
-# Send reminders to users who indicated these statuses
-SEND_REMINDERS_TO = ['Yes', 'Partly', 'Maybe']
 # By default, send reminders for events this number of minutes before start time
 REMINDER_TIME = 20
 # Emoji used to issue a shortcut reminder request
@@ -167,8 +174,8 @@ def emoji_to_status(emoji):
     return matched_status
 
 def pprint_attendance_instructions():
-    msg = '*Update your status by reacting with the corresponding emoji.*'
-    msg += '\n*Request a 20 minute heads-up via DM by additionally reacting* ' + REMINDER_EMOJI
+    msg = '*Update your status by reacting to this message with the corresponding emoji.*'
+    msg += '\n`Request a 20 minute heads-up via DM by additionally reacting {}`'.format(REMINDER_EMOJI)
     return msg
 
 # Datetime time: datetime object to convert to formatted string
@@ -442,13 +449,19 @@ async def on_ready():
     print("Current time: {}".format(pprint_time(datetime.datetime.now(BOT_TZ))))
     print('-----------')
 
+
 @bot.event
-async def on_reaction_add(reaction, user):
-    listen_to_reactions = "by react" in reaction.message.content
+async def on_raw_reaction_add(payload):
+    guild = bot.get_guild(payload.guild_id)
+    channel = guild.get_channel(payload.channel_id)
+    user = bot.get_user(payload.user_id)
+    message = await channel.get_message(payload.message_id)
+    reaction = message.reactions[0]
+    print (message.reactions)
+
+    listen_to_reactions = "by react" in message.content
 
     if listen_to_reactions:
-        message = reaction.message
-        channel = message.channel
         status = emoji_to_status(reaction.emoji)
         event_name = message.content.splitlines()[0].replace('*','')
 
