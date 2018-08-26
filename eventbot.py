@@ -10,7 +10,7 @@ from dateparser import parse
 
 __python__ = 3.6
 __author__ = "github.com/meeow" 
-__version__ = "1.4.2" + "https://github.com/meeow/eventbot"
+__version__ = "1.5" + "https://github.com/meeow/eventbot"
 
 # Files in this repo:
 # - eventbot.py (this file!)
@@ -22,13 +22,14 @@ __version__ = "1.4.2" + "https://github.com/meeow/eventbot"
 # - Add command to set custom time in advance to send reminder
 # - Add ability to send /tts reminders
 # - Add way to unset reminders
-# - Add customization options via discord interface
+# - Change customization options via discord interface (e.g. change command prefix)
 # - Unit tests
 
 # Nice to have:
-# - Role permissions to call certain commands
 # - Chronological order !show_all 
 # - Allow reactions to messages not in message cache
+# - Destroy background tasks more cleanly
+# - Auto-prune stale events
 
 # Warnings:
 # - May have unexpected behavior if another user reacts before the bot clears the previous user's reaction
@@ -58,8 +59,14 @@ __version__ = "1.4.2" + "https://github.com/meeow/eventbot"
 # - v1.4.1 (heroku build 164)
 #   * Revised instructions to account for heroku dyno cycling clearing message cache
 # - v1.4.2 (heroku build 178)
-#   * Use raw reactions to handle reaction detection, if target message is not cached
+#   * Use raw reactions to handle reaction detection, to enable reaction functionaliy even if target message is not cached
 #   * Revise instructions to account for this bugfix
+# - v1.5 (heroku build 191)
+#   * Add guild id to metadata, allowing for use in multiple servers
+#   * Minor style changes to instructions message
+#   * Add command aliases
+#   * Improve !help  
+
 
 # ==== Database and Context Setup ====
 
@@ -73,6 +80,7 @@ db = client.eventbot
 db.authenticate(MLAB_USER, MLAB_PASS)
 
 EVENTS = db.events.with_options(codec_options=CodecOptions(tz_aware=True))
+CONFIG = db.config.with_options(codec_options=CodecOptions(tz_aware=True))
 
 
 # ==== Bot config options ====
@@ -90,6 +98,9 @@ REMINDER_EMOJI = '⏰'
 # Interval to check for reminders which need sending, in seconds
 REMINDER_CYCLE = 10
 
+# Interval to check for stale events, in seconds
+STALE_CHECK_CYCLE = REMINDER_CYCLE
+
 BOT_TZ = timezone('America/New_York')
 
 # Top 'x' number of roles in the server's role hierarchy allowed to perform admin commands
@@ -106,19 +117,16 @@ def is_admin(ctx):
     else:
         return False
 
-# discord.Context ctx: context of command which calls this function
+# Context ctx: context of command which calls this function
 # string name: name of event to check authorship of
 def is_author(ctx, name):
     if not event_exists(name): 
         return False
-
     event = get_event(name)
-
     msg_author = ctx.message.author.name + '#' + ctx.message.author.discriminator
-
     return msg_author == event['Author']
 
-# discord.Context ctx: context of command which calls this function
+# Context ctx: context of command which calls this function
 def pprint_insufficient_privileges(ctx):
     msg = "Error: You have insufficient privileges to perform this action."
     return msg
@@ -126,6 +134,22 @@ def pprint_insufficient_privileges(ctx):
 # string name: name of event to search for
 def event_exists(name):
     return bool(EVENTS.find({"Name": name}).limit(1).count())
+
+# dict event: dict representing event to check ownership
+# Guild guild: guild to check for ownership of event
+def event_belongs_to_guild(event, guild):
+    return event['Metadata']['GuildID'] == guild.id
+
+# Guild guild: guild to check for ownership of event
+# string name: name of event to search for
+def event_exists_and_belongs_to_guild(guild, name):
+    exists = event_exists(name)
+    if exists:
+        event = get_event(name)
+        belongs = event_belongs_to_guild(event, guild)
+        return bool(belongs)
+    else:
+        return False
 
 # datetime time: time to search for conflicts
 def time_exists(time):
@@ -174,8 +198,8 @@ def emoji_to_status(emoji):
     return matched_status
 
 def pprint_attendance_instructions():
-    msg = '*Update your status by reacting to this message with the corresponding emoji.*'
-    msg += '\n`Request a 20 minute heads-up via DM by additionally reacting {}`'.format(REMINDER_EMOJI)
+    msg = '`Update your status by reacting to **this message** with the corresponding emoji.`'
+    msg += '\n`Request a 20 minute heads-up via DM by additionally reacting {}. You must be able to receive DMs from non-friends.`'.format(REMINDER_EMOJI)
     return msg
 
 # Datetime time: datetime object to convert to formatted string
@@ -187,7 +211,6 @@ def pprint_time(time):
         time = time.astimezone(BOT_TZ)
 
     utc_offset = get_utc_offset_hrs
-    #time = 
     msg = time.strftime("%A %-m/%-d %-I:%M%p %Z") 
     return msg
 
@@ -215,29 +238,27 @@ def update_field(id, key, value):
 # string date: date in mm/dd format 
 # string time: time in 24 hr or 12 hr format
 def input_to_datetime(inp):
-    print("Input time:", inp)
     time = parse(inp)
 
     bot_localtime = datetime.datetime.now(BOT_TZ)
     utc_offset = get_utc_offset_hrs()
 
     if time.tzinfo is None or time.tzinfo.utcoffset(time) is None:
-        print ("No timezone provided. Assuming bot's local UTC offset of {} hours".format(utc_offset))
         time = BOT_TZ.localize(time)
-        print ("Set timezone to {}".format(time.tzinfo))
         if "in" in inp:
             time = time + datetime.timedelta(hours=utc_offset)
-        print ("Saving time as {}".format(pprint_time(time)))
 
     return time
 
 
 # ==== Internal Logic ====
+
+# context ctx: used to get discord guild name
 # string name: name of event to create
 # string date: date in mm/dd format 
 # string mil_time: time in 24 hr format
 # string description: descrption of event
-def new_event(name, author, date, time, description='No description.'):
+def new_event(ctx, name, author, date, time, description='No description.'):
     if event_exists(name):
         return name + " already exists in upcoming events."
 
@@ -257,9 +278,9 @@ def new_event(name, author, date, time, description='No description.'):
     for status in STATUSES.keys():
         event[status] = []
 
-    # Intended to be hidden when printing
-    event["Metadata"] = {"Reminders": {}}
-
+    # hidden from view
+    event["Metadata"] = {"Reminders": {}, "GuildID": ctx.message.guild.id}
+    
     EVENTS.insert_one(event)
 
     msg = pprint_event(name) + pprint_attendance_instructions()
@@ -276,13 +297,13 @@ def delete_event(name):
         msg = pprint_event_not_found(name)
     return msg
 
-
-def delete_past_events():
+# Guild guild: guild whose events to delete
+def delete_past_events(guild):
     msg = ''
 
     cursor = EVENTS.find({})
     for event in cursor:
-        if is_past(event['Time']):
+        if is_past(event['Time']) and event_belongs_to_guild(event, guild):
             msg += "{} - {}\n".format(event['Name'], pprint_time(event['Time']))
             delete_event(event['Name'])
 
@@ -328,16 +349,18 @@ def pprint_event(name, verbose=True):
     return msg + '\n'
 
 
-def pprint_all_events():
-    msg = 'Showing all events. Use command `!show [event name]` for detailed info.\n\n'
+# Guild guild: guild to print events for
+def pprint_all_events(guild):
+    msg = 'Showing all events for {}. Use command `!show [event name]` for detailed info.\n\n'.format(guild.name)
     found_events = ''
 
     cursor = EVENTS.find({})
     for event in cursor:
-        found_events += pprint_event(event['Name'], verbose=False)
+        if event_belongs_to_guild(event, guild): 
+            found_events += pprint_event(event['Name'], verbose=False)
 
     if not found_events:
-        msg = 'No upcoming events.'
+        msg = 'No upcoming events for {}.'.format(guild.name)
     else:
         msg += found_events
     
@@ -407,20 +430,39 @@ def delete_reminder(event, username):
     update_field(event_id, 'Metadata', metadata)
 
 
-# ==== Discord specific helper functions ====
+# ==== Discord specific helpers ====
 async def send_temp_message(ctx, msg):
     temp_msg = await ctx.send(msg)
     await temp_msg.edit(content=msg, delete_after=ERR_MSG_DURATION)
 
+'''
+async def switch_collection(ctx):
+    global db 
+    guild = ctx.message.guild.name
+    db = client[guild]
+    db.authenticate(MLAB_USER, MLAB_PASS)
+    print ("Swiched to", guild, "database")
+'''
+'''
+def _prefix_callable(bot, msg):
+    user_id = bot.user.id
+    base = ['<@!{}> '.format(user_id), '<@{}> '.format(user_id)]
+    if msg.guild is None:
+        base.append('!')
+    else:
+        base.extend(bot.prefixes.get(msg.guild.id, ['?', '!']))
+    return base
+'''
 
-# ==== User Interactions ====
+# ==== Bot init ====
 
 bot = commands.Bot(command_prefix='!')
+
 # Remove default help command
 bot.remove_command('help')
 
 
-# Background tasks
+# ==== Background tasks ====
 
 async def send_reminders():
     await bot.wait_until_ready()
@@ -440,14 +482,15 @@ async def send_reminders():
         await asyncio.sleep(REMINDER_CYCLE)
 
 
-# Events 
+# ==== Events ====
 
 @bot.event
 async def on_ready():
-    await bot.change_presence(activity=discord.Game(name='!help'))
+    await bot.change_presence(activity=discord.Game(name='Say !help'))
     print('Logged in as: {}'.format(bot.user.name))
     print("Current time: {}".format(pprint_time(datetime.datetime.now(BOT_TZ))))
-    print('-----------')
+    print("Currently active on servers:\n", '\n'.join([guild.name for guild in bot.guilds]))
+    print('-------------------')
 
 
 @bot.event
@@ -467,7 +510,7 @@ async def on_raw_reaction_add(payload):
 
         if reaction.emoji == REMINDER_EMOJI:
             set_reminder(event_name, user)
-            await user.send("Got it! You should get a reminder for {} {} minutes before it starts. This feature is currently in beta, so try not to rely too heavily on it.".format(event_name, REMINDER_TIME))
+            await user.send("Got it! You should get a reminder for {} {} minutes before it starts.".format(event_name, REMINDER_TIME))
         elif not status:
             msg = '**Not a valid reaction option.** Please try again using one of the specified emojis.'
             err_message = await channel.send(msg)
@@ -480,28 +523,35 @@ async def on_raw_reaction_add(payload):
         await message.clear_reactions()
 
 
-# Commands
+# ==== Commands ====
 
 @bot.command()
 async def show(ctx, *, name):
+    msg = ''
     name = name.strip('\"')
-    msg = pprint_event(name)
-    if event_exists(name):
+    guild = ctx.message.guild
+
+    if event_exists_and_belongs_to_guild(guild, name):
+        msg = pprint_event(name)
         msg += pprint_attendance_instructions()
+    else:
+        msg = pprint_event_not_found(name)
+
     await ctx.send(msg)
 
-@bot.command()
+@bot.command(aliases=["sa"])
 async def show_all(ctx):
-    msg = pprint_all_events()
+    guild = ctx.message.guild
+    msg = pprint_all_events(guild)
     await ctx.send(msg)
 
-@bot.command()
+@bot.command(aliases=["sched"])
 async def schedule(ctx, name, date, time, description='No description.'):
     discord_tag = ctx.message.author.name + '#' + ctx.message.author.discriminator
-    msg = new_event(name, discord_tag, date, time, description)
+    msg = new_event(ctx, name, discord_tag, date, time, description)
     await ctx.send(msg)
 
-@bot.command()
+@bot.command(aliases=["resched", "rs"])
 async def reschedule(ctx, name, *, datetime):
     if not event_exists(name):
         msg = pprint_event_not_found(name)
@@ -516,7 +566,7 @@ async def reschedule(ctx, name, *, datetime):
         msg = "Set {} to {}.".format(name, pprint_time(time))
         await ctx.send(msg)
 
-@bot.command()
+@bot.command(aliases=["unsched", "us"])
 async def unschedule(ctx, *, name):
     if is_admin(ctx) or is_author(ctx, name):
         name = name.strip('\"')
@@ -526,9 +576,10 @@ async def unschedule(ctx, *, name):
         msg = pprint_insufficient_privileges(ctx)
         await send_temp_message(ctx, msg)
 
-@bot.command()
+@bot.command(aliases=["usp"])
 async def unschedule_past(ctx):
-    msg = delete_past_events()
+    guild = ctx.message.guild
+    msg = delete_past_events(guild)
     await ctx.send(msg)
 
 # User can change value of a field which is a string.
@@ -544,7 +595,7 @@ async def edit(ctx, name, key, value):
     if (
         (key in event and not isinstance(event[key], str)) or 
         (not (is_admin(ctx) or is_author(ctx, name))) or 
-        (key == "Author" and not is_admin(ctx))
+        ((key == "Author" or key == "Metadata") and not is_admin(ctx))
         ):
         msg += "Error: the specified field cannot be changed using this command or you do not have permission."
         await send_temp_message(ctx, msg)
@@ -554,38 +605,45 @@ async def edit(ctx, name, key, value):
         await ctx.send(msg)
 
 
-# Custom help command
+# ==== Documentation ====
+
 @bot.command()
 async def help(ctx):
-    embed = discord.Embed(title="== eventbot (by Meeow) ==", description="List of commands are:", color=0xeee657)
+    title = "== eventbot v{} (by Meeow) ==".format(__version__)
+    embed = discord.Embed(title=title, description="List of commands are:", color=0xeee657)
 
     embed.add_field(
         name="!schedule [name] [date (mm/dd)] [time] [description]", 
         value='''Create a new event. 
         Use quotes if your name or description parameter has spaces in it.
-        Example: !schedule "Scrim against SHD" "Descriptive description." 3/14 1:00PM''', 
+        Example: `!schedule "Scrim against SHD" "Descriptive description." 3/14 1:00PM`
+        Aliases: !sched''', 
         inline=False)
 
     embed.add_field(
         name="!reschedule [name] [datetime] ", 
         value='''Edit the time of an existing event.  
         Use quotes if your name or description parameter has spaces in it.
-        Example: !reschedule "Scrim against SHD" 4/1 13:30''', 
+        Example: `!reschedule "Scrim against SHD" 4/1 13:30`
+        Aliases: !resched, !rs''', 
         inline=False)
 
     embed.add_field(
         name="!unschedule [event_name]", 
-        value="Delete the specified event entirely. Usage restricted to author of the event and admins.", 
+        value='''Delete the specified event entirely. Usage restricted to author of the event and admins.
+        Aliases: !unsched, !us''', 
         inline=False)
 
     embed.add_field(
         name="!unschedule_past", 
-        value="Delete ALL past events entirely.", 
+        value='''Delete ALL past events entirely.
+        Aliases: !usp''', 
         inline=False)
 
     embed.add_field(
         name="!show_all", 
-        value="Show name and time for all upcoming events.", 
+        value='''Show name and time for all upcoming events.
+        Aliases: !sa''', 
         inline=False)
 
     embed.add_field(
@@ -598,10 +656,8 @@ async def help(ctx):
         value='''Edit field with a string type value (not dates or attendance lists).
         Non-admins may not edit the `Author` field.
         Use quotes if your parameter has spaces in it. 
-        Example: !edit "Scrim against SHD" "Description" "Improved description."''', 
+        `Example: !edit "Scrim against SHD" "Description" "Improved description."`''', 
         inline=False)
-
-    await ctx.send(embed=embed)
 
 
 # ==== Undocumented Commands for Debugging/Admin ====
@@ -620,7 +676,7 @@ async def factory(ctx, num_events=5):
         date = '9/{}'.format(num+1)
         time = str(1 + num) + ':00pm'
         name = '-test' + str(num)
-        msg = new_event(name, ctx.message.author.name, date, time)
+        msg = new_event(ctx, name, ctx.message.author.name, date, time)
         await ctx.send(msg)
         print ("Factory creating event on date {} at time {}".format(date, time))
 
@@ -644,7 +700,7 @@ async def dump_roles(ctx):
     await ctx.send('Logged roles in console.')
 
 
-# ==== Run Bot ====
+# ==== Run ====
 bot.loop.create_task(send_reminders())
 bot.run(BOT_TOKEN)
 
