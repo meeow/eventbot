@@ -1,16 +1,15 @@
-import discord, datetime, asyncio, pytz
+import discord, datetime, asyncio, pytz, logging
+from logging import info, warning, debug, error, critical
 from discord.ext import commands
 from pymongo import MongoClient
 from bson.codec_options import CodecOptions
-
 from os import environ
-
 from pytz import timezone
 from dateparser import parse
 
 __python__ = 3.6
 __author__ = "github.com/meeow/eventbot" 
-__version__ = '1.6'
+__version__ = '2.0'
 
 # Files in this repo:
 # - eventbot.py (this file!)
@@ -36,62 +35,39 @@ __version__ = '1.6'
 # - Cannot make 2 events of the same name even if it is owned by a different guild
 # - It is possible to set a reminder for an event which has been deleted
 
-# Current version history:
-# - v1.1 
-#   * Add unschedule_past command
-# - v1.2 (heroku build 121)
-#   * Save datetimes as timezone aware in mongodb
-#   * More accurate datetime parsing and validations
-#   * Basic factory, teardown commands for testing
-#   * Improve code style
-# - v1.3 (heroku build 131)
-#   * Add basic permission system
-#       + Configure minimum admin role (in .py file, command soon)
-#       + Author may edit or delete own events
-#       + Admin may edit or delete any events
-#       + Anyone may delete all past events
-#   * Make more error messages temporary
-# - v1.3.1 (heroku build 143)
-#   * Minor refactoring
-#   * Begin implementing reminders
-# - v1.4 (heroku build 163)
-#   * Initial implementation of reminders
-#       + React with ⏰ emoji to receive a reminder DM 20 mins before start of event
-#       + Additional functionality coming soon
-# - v1.4.1 (heroku build 164)
-#   * Revised instructions to account for heroku dyno cycling clearing message cache
-# - v1.4.2 (heroku build 178)
-#   * Use raw reactions to handle reaction detection, to enable reaction functionaliy even if target message is not cached
-#   * Revise instructions to account for this bugfix
-# - v1.5 (heroku build 196)
-#   * Add guild id to metadata, allowing for use in multiple servers
-#   * Minor style changes to instructions message
-#   * Add command aliases
-#   * Improve !help  
-# - v1.5.1 (heroku build 204)
-#   * Patch unintended deletion permissions
-#   * Begin work on server-specific settings
-# - v1.6 (heroku build 213)
-#   * Initial implementation of server specific timezones
-# - v1.6.1 (heroku build 226)
-#   * Timezone related bugfixes
-#   * Some refactoring
+# Version history:
+# Older versions: see README.md
+# v2.0 (build 247)
+#   - Add flag to simplify switching between local and heroku hosting
+#   - Major overhaul db logic to fix bugs when bot was used in multiple servers
+#   - Minor refactoring/cleanup
+#   - Add more command aliases for !show (!s, !sh) and !scheudle (!sch)
 
+# ==== Logging config ====
+logging.basicConfig(level=logging.INFO)
+
+def log_command(ctx):
+    info("{} ({}): {}".format(ctx.message.author.name, ctx.message.guild.name, ctx.message.content))
 
 # ==== Database and Context Setup ====
 
-# Heroku environment variables 
-BOT_TOKEN = environ['BOT_TOKEN'] 
-MLAB_USER = environ['MONGOUSER']
-MLAB_PASS = environ['MONGOPASS']
+HEROKU = True
 
-client = MongoClient("ds018498.mlab.com", 18498)
-db = client.eventbot
-db.authenticate(MLAB_USER, MLAB_PASS)
+# Heroku environment variables 
+if HEROKU:
+    client = MongoClient("ds018498.mlab.com", 18498)
+    db = client.eventbot
+    BOT_TOKEN = environ['BOT_TOKEN'] 
+    MLAB_USER = environ['MONGOUSER']
+    MLAB_PASS = environ['MONGOPASS']
+    db.authenticate(MLAB_USER, MLAB_PASS)
+else:
+    client = MongoClient()
+    db = client.eventbot
+    BOT_TOKEN = open('../bot_token.txt', 'r').read().strip('\n')
 
 EVENTS = db.events.with_options(codec_options=CodecOptions(tz_aware=True))
 CONFIG = db.config.with_options(codec_options=CodecOptions(tz_aware=True))
-
 
 # ==== Bot default options ====
 
@@ -117,15 +93,24 @@ US_TZ = set([tz for tz in pytz.all_timezones if tz.startswith('US')])
 
 # Top 'x' number of roles in the server's role hierarchy allowed to perform admin commands
 ADMIN_ROLES = 1 
+# Do not allow non admins to modify these fields using !edit
+RESTRICTED = {"Author", "Metadata", "Time", "Date"}
 
 
 # ==== Helper Functions: MongoDB interface ====
+
+def get_collection(guild_id):
+    guild_id = str(guild_id)
+    return db[guild_id].with_options(codec_options=CodecOptions(tz_aware=True))
 
 # int id: value of _id field of target mongodb document 
 # * key: name of field to update
 # * value: value to update field with
 # collection collection: mongoDB collection to target
 def update_field(id, key, value, collection=EVENTS):
+    if collection == EVENTS:
+        warning("Falling back to default events collection!")
+        
     result = collection.update_one(
     {
         '_id': id
@@ -153,11 +138,11 @@ def get_config(guild_id):
     return config
 
 # int guild_id: name of server to search for
-def guild_exists(guild_id):
+def guild_config_exists(guild_id):
     return bool(CONFIG.find({"ID": guild_id}).limit(1).count())
 
 # int guild_id: guild_id of server to create config document for
-def new_guild(guild_id):
+def new_guild_config(guild_id):
     guild = {"ID": guild_id}
     CONFIG.insert_one(guild)
 
@@ -175,9 +160,10 @@ def is_admin(ctx):
 # Context ctx: context of command which calls this function
 # string name: name of event to check authorship of
 def is_author(ctx, name):
-    if not event_exists(name): 
+    collection = get_collection(ctx.message.guild.id)
+    if not event_exists(name, collection): 
         return False
-    event = get_event(name)
+    event = get_event(name, collection)
     msg_author = ctx.message.author.name + '#' + ctx.message.author.discriminator
     return msg_author == event['Author']
 
@@ -185,43 +171,27 @@ def pprint_insufficient_privileges():
     msg = "Error: You have insufficient privileges to perform this action."
     return msg
 
-# dict event: dict representing event to check ownership
-# Guild guild: guild to check for ownership of event
-def event_belongs_to_guild(event, guild_id):
-    return event['Metadata']['GuildID'] == guild_id
-
 
 # ==== Helper Functions: Datetime ====
 
 # datetime time: time to search for conflicts
-def time_exists(time, guild_id):
-    events = EVENTS.find({"Time": time})
-    for event in events:
-        if event_belongs_to_guild(event, guild_id): 
-            return True
-    return False
+def time_exists(time, collection=EVENTS):
+    events = collection.find({"Time": time})
+    return events.count()
 
 # datetime time: time to determine if it is in the past
 def is_past(time):
     present = datetime.datetime.now(DEFAULT_TZ)
     return time.astimezone(DEFAULT_TZ) < present
 
-'''
-def get_utc_offset_hrs():
-    bot_localtime = datetime.datetime.now(DEFAULT_TZ)
-    utc_offset = datetime.datetime.now(DEFAULT_TZ).utcoffset().total_seconds()/60/60
-    return utc_offset
-'''
-
 # Datetime time: datetime object to convert to formatted string
 def pprint_time(time, tz=DEFAULT_TZ):
     if time.tzinfo is None or time.tzinfo.utcoffset(time) is None: 
-        print ("Localizing naive time...")  
+        info("Localizing naive time {} to {}".format(time, tz))  
         time = tz.localize(time)
     else:
         time = time.astimezone(tz)
 
-    #utc_offset = get_utc_offset_hrs
     msg = time.strftime("%A %-m/%-d %-I:%M%p %Z") 
     return msg
 
@@ -230,19 +200,18 @@ def pprint_time(time, tz=DEFAULT_TZ):
 def set_timezone(guild_id, timezone):
     if timezone not in VALID_TZ:
         return False
-
-    if not guild_exists(guild_id):
-        new_guild(guild_id)
+    if not guild_config_exists(guild_id):
+        new_guild_config(guild_id)
 
     config_id = config_to_id(guild_id)
     update_field(config_id, 'Timezone', timezone, collection=CONFIG)
+    info('Server set to timezone: {}'.format(timezone))
     return True
 
 # int guild_id: id of server to get timezone of
 def get_timezone(guild_id):
     config = get_config(guild_id)
     if config and 'Timezone' in config:
-        print ('Server set to timezone:', config['Timezone'])
         return pytz.timezone(config['Timezone'])
     else:
         return DEFAULT_TZ
@@ -250,44 +219,31 @@ def get_timezone(guild_id):
 # string inp: user datetime input
 def input_to_datetime(inp, tz=DEFAULT_TZ):
     time = parse(inp)
-    print ('User input:', inp, time)
-
     bot_localtime = datetime.datetime.now(tz)
-    #utc_offset = get_utc_offset_hrs()
 
     if time.tzinfo is None: #or time.tzinfo.utcoffset(time) is None:
         time = tz.localize(time)
-        if "in" in inp:
-            time = time + datetime.timedelta(hours=utc_offset)
-
     return time
 
 
 # ==== Helper Functions: Events general ====
 
 # string name: name of event to search for
-def event_exists(name):
-    return bool(EVENTS.find({"Name": name}).limit(1).count())
-
-# Guild guild: guild to check for ownership of event
-# string name: name of event to search for
-def event_exists_and_belongs_to_guild(guild_id, name):
-    exists = event_exists(name)
-    if exists:
-        event = get_event(name)
-        belongs = event_belongs_to_guild(event, guild_id)
-        return bool(belongs)
-    else:
-        return False
+def event_exists(name, collection=EVENTS):
+    if collection == EVENTS:
+        warning("Falling back to default events collection!")
+    return bool(collection.find({"Name": name}).limit(1).count())
 
 # string name: name of event to return
-def get_event(name):
-    event = EVENTS.find_one({'Name': name})
+def get_event(name, collection=EVENTS):
+    if collection == EVENTS:
+        warning("Falling back to default events collection!")
+    event = collection.find_one({'Name': name})
     return event
 
 # string name: name of event to find id of
-def name_to_id(name):
-    event = EVENTS.find_one({'Name': name})
+def get_event_id(name, collection=EVENTS):
+    event = collection.find_one({'Name': name})
     event_id = event['_id']
     return event_id
 
@@ -313,8 +269,8 @@ def emoji_to_status(emoji):
     return matched_status
 
 def pprint_attendance_instructions():
-    msg = '*Update your status by reacting to **this message** with the corresponding emoji.'
-    msg += '\nRequest a 20 minute heads-up via DM by also reacting {}. You must be able to receive DMs from non-friends.*'.format(REMINDER_EMOJI)
+    msg = '```Update your status by reacting to this message with the corresponding emoji.'
+    msg += '\nRequest a 20 minute heads-up via DM by also reacting {}. You must be able to receive DMs from non-friends.```'.format(REMINDER_EMOJI)
     return msg
 
 # string name: invalid search string
@@ -330,17 +286,20 @@ def pprint_event_not_found(name):
 # string date: date in mm/dd format 
 # string mil_time: time in 24 hr format
 # string description: descrption of event
-def new_event(ctx, name, author, date, time, description='No description.'):
-    if event_exists(name):
-        return name + " already exists in upcoming events."
-
+def new_event(ctx, name, date, time, description='No description.'):
     guild_id = ctx.message.guild.id
+    collection = get_collection(guild_id)
     time = input_to_datetime(date + ' ' + time, tz=get_timezone(guild_id))
     timezone = get_timezone(guild_id)
+    author = ctx.message.author.name + '#' + ctx.message.author.discriminator
 
-    if is_past(time):
+    if event_exists(name, collection):
+        return name + " already exists in upcoming events."
+    elif is_past(time):
+        warning("Failed to schedule event at {}".format(time))
         return "The specified date/time occurred in the past."
-    if time_exists(time, guild_id):
+    if time_exists(time, collection):
+        warning("Failed to schedule event at {}".format(time))
         return "There is already an event scheduled for {}".format(pprint_time(time))
 
     event = {'Name': name,
@@ -353,15 +312,15 @@ def new_event(ctx, name, author, date, time, description='No description.'):
     for status in STATUSES.keys():
         event[status] = []
 
-    EVENTS.insert_one(event)
+    collection.insert_one(event)
 
-    msg = pprint_event(name, tz=timezone) + pprint_attendance_instructions()
+    msg = pprint_event(name, tz=timezone, collection=collection) + pprint_attendance_instructions()
     return msg 
 
 # string name: name of event to delete
-def delete_event(name):
-    if event_exists(name):
-        result = EVENTS.remove({"Name": name})
+def delete_event(name, collection=EVENTS):
+    if event_exists(name, collection):
+        result = collection.remove({"Name": name})
         msg = "Removed {}.".format(name)
     else:
         msg = pprint_event_not_found(name)
@@ -370,12 +329,14 @@ def delete_event(name):
 # Guild guild: guild whose events to delete
 def delete_past_events(guild_id):
     msg = ''
+    collection = get_collection(guild_id)
 
-    cursor = EVENTS.find({})
+    cursor = collection.find({})
     for event in cursor:
-        if is_past(event['Time']) and event_belongs_to_guild(event, guild_id):
+        if is_past(event['Time']):
             msg += "{} - {}\n".format(event['Name'], pprint_time(event['Time']))
-            delete_event(event['Name'])
+            delete_event(event['Name'], collection)
+            info("Deleted {}.".format(event['Name']))
 
     if msg:
         msg = "The following past events were deleted: \n\n" + msg
@@ -385,11 +346,11 @@ def delete_past_events(guild_id):
 
 # string name: name of event to pretty print
 # bool verbose: print only name and time if False
-def pprint_event(name, verbose=True, tz=DEFAULT_TZ):
-    if event_exists(name) == False:
+def pprint_event(name, verbose=True, tz=DEFAULT_TZ, collection=EVENTS):
+    if event_exists(name, collection) == False:
         return pprint_event_not_found(name)
 
-    event = get_event(name)
+    event = get_event(name, collection)
     msg = ''
 
     for field in event:
@@ -420,11 +381,11 @@ def pprint_all_events(guild_id):
     msg = 'Showing all events. Use command `!show [event name]` for detailed info.\n\n'
     found_events = ''
     timezone = get_timezone(guild_id)
+    collection = get_collection(guild_id)
 
-    cursor = EVENTS.find({})
+    cursor = collection.find({})
     for event in cursor:
-        if event_belongs_to_guild(event, guild_id): 
-            found_events += pprint_event(event['Name'], tz=timezone, verbose=False)
+        found_events += pprint_event(event['Name'], tz=timezone, verbose=False, collection=collection)
 
     if not found_events:
         msg = 'No upcoming events.'
@@ -435,8 +396,8 @@ def pprint_all_events(guild_id):
 # string event_name: name of event to change status of
 # string user: username#discriminator of user to change status of
 # string status: new status
-def set_attendance(event_name, user, status):
-    if not event_exists(event_name):
+def set_attendance(event_name, user, status, collection=EVENTS):
+    if not event_exists(event_name, collection):
         return pprint_event_not_found(event_name)
     
     if not isinstance(user, str):
@@ -444,8 +405,8 @@ def set_attendance(event_name, user, status):
     else:
         user_name = user
 
-    event = get_event(event_name)
-    event_id = name_to_id(event_name)
+    event = get_event(event_name, collection)
+    event_id = get_event_id(event_name, collection)
 
     old_status = []
     for s in STATUSES:
@@ -456,11 +417,11 @@ def set_attendance(event_name, user, status):
             old_status = [s, event[s]] 
 
     if old_status:
-        update_field(event_id, old_status[0], old_status[1])
+        update_field(event_id, old_status[0], old_status[1], collection)
 
     if not old_status or (old_status and status != old_status[0]):
         attendance_status = event[status] + [user_name]
-        update_field(event_id, status, attendance_status)
+        update_field(event_id, status, attendance_status, collection)
 
     return "Set **{}'s** status to **{}** for **{}**.".format(user_name, status, event_name)
 
@@ -470,8 +431,8 @@ def set_attendance(event_name, user, status):
 # string event_name: name of event to set reminder for
 # string user: username#discriminator of user to set reminder for
 # int/float time: minutes before event begins to send reminders
-def set_reminder(event_name, user, time=REMINDER_TIME):
-    if not event_exists(event_name):
+def set_reminder(event_name, user, time=REMINDER_TIME, collection=EVENTS):
+    if not event_exists(event_name, collection):
         return pprint_event_not_found(event_name)
     
     if not isinstance(user, str):
@@ -479,22 +440,22 @@ def set_reminder(event_name, user, time=REMINDER_TIME):
     else:
         user_name = user
 
-    event = get_event(event_name)
-    event_id = name_to_id(event_name)
+    event = get_event(event_name, collection)
+    event_id = event['_id']
 
     metadata = event['Metadata']
     metadata['Reminders'][user_name] = time
     
-    update_field(event_id, 'Metadata', metadata)
+    update_field(event_id, 'Metadata', metadata, collection)
     return "Set {} minutes reminder for **{}**.".format(time, event_name)
 
 # event: event entry in mongodb
 # string username: user.name#user.discriminator
-def delete_reminder(event, username):
-    event_id = name_to_id(event['Name'])
+def delete_reminder(event, username, collection=EVENTS):
+    event_id = get_event_id(event['Name'], collection)
     metadata = event['Metadata']
     del metadata['Reminders'][username] 
-    update_field(event_id, 'Metadata', metadata)
+    update_field(event_id, 'Metadata', metadata, collection)
 
 
 # ==== Discord specific helpers ====
@@ -502,24 +463,6 @@ async def send_temp_message(ctx, msg):
     temp_msg = await ctx.send(msg)
     await temp_msg.edit(content=msg, delete_after=TEMP_MESSAGE_DURATION)
 
-'''
-async def switch_collection(ctx):
-    global db 
-    guild = ctx.message.guild.name
-    db = client[guild]
-    db.authenticate(MLAB_USER, MLAB_PASS)
-    print ("Swiched to", guild, "database")
-'''
-'''
-def _prefix_callable(bot, msg):
-    user_id = bot.user.id
-    base = ['<@!{}> '.format(user_id), '<@{}> '.format(user_id)]
-    if msg.guild is None:
-        base.append('!')
-    else:
-        base.extend(bot.prefixes.get(msg.guild.id, ['?', '!']))
-    return base
-'''
 
 # ==== Bot init ====
 
@@ -535,17 +478,21 @@ async def send_reminders():
     await bot.wait_until_ready()
 
     while 1:
-        cursor = EVENTS.find({})
-        for event in cursor:
-            reminders = event['Metadata']['Reminders']
-            for user_name in list(event['Metadata']['Reminders'].keys()):
-                present = datetime.datetime.now(DEFAULT_TZ)
-                if present + datetime.timedelta(minutes=reminders[user_name]) >= event['Time']:
-                    print("Sending reminder:", event['Name'], reminders)
-                    event_name = event["Name"]
-                    user = username_to_user(bot, user_name)
-                    await user.send("Hey! Your event {} is starting within {} minutes!".format(event['Name'], reminders[user_name]))
-                    delete_reminder(event, user_name)
+        for name in db.collection_names():
+            if not name.isdigit():
+                continue
+            collection = get_collection(name)
+            cursor = collection.find({})
+            for event in cursor:
+                reminders = event['Metadata']['Reminders']
+                for user_name in list(event['Metadata']['Reminders'].keys()):
+                    present = datetime.datetime.now(DEFAULT_TZ)
+                    if present + datetime.timedelta(minutes=reminders[user_name]) >= event['Time']:
+                        info("Sending reminder: {} {}".format(event['Name'], reminders))
+                        event_name = event["Name"]
+                        user = username_to_user(bot, user_name)
+                        await user.send("Hey! Your event {} is starting within {} minutes!".format(event['Name'], reminders[user_name]))
+                        delete_reminder(event, user_name, collection)
         await asyncio.sleep(REMINDER_CYCLE)
 
 
@@ -555,9 +502,9 @@ async def send_reminders():
 async def on_ready():
     status = 'Say !help'#'DOWN FOR MAINT' #
     await bot.change_presence(activity=discord.Game(name=status))
-    print('Logged in as: {}'.format(bot.user.name))
-    print("Current time: {}".format(pprint_time(datetime.datetime.now(DEFAULT_TZ))))
-    print("Currently active on servers:\n", '\n'.join([guild.name for guild in bot.guilds]))
+    info('Logged in as: {}'.format(bot.user.name))
+    info("Current time: {}".format(pprint_time(datetime.datetime.now(DEFAULT_TZ))))
+    info("Currently active on servers:\n{}".format('\n'.join([guild.name for guild in bot.guilds])))
     print('-------------------')
 
 
@@ -569,24 +516,25 @@ async def on_raw_reaction_add(payload):
     message = await channel.get_message(payload.message_id)
     reaction = message.reactions[0]
     timezone = get_timezone(guild.id)
-    print (message.reactions)
+    collection = get_collection(payload.guild_id)
 
     listen_to_reactions = "by react" in message.content
 
     if listen_to_reactions:
         status = emoji_to_status(reaction.emoji)
         event_name = message.content.splitlines()[0].replace('*','')
+        info("{} reacted {} to {}".format(user.name, reaction, event_name))
 
         if reaction.emoji == REMINDER_EMOJI:
-            set_reminder(event_name, user)
+            set_reminder(event_name, user, collection=collection)
             await user.send("Got it! You should get a reminder for {} {} minutes before it starts.".format(event_name, REMINDER_TIME))
         elif not status:
             msg = '**Not a valid reaction option.** Please try again using one of the specified emojis.'
             err_message = await channel.send(msg)
             await err_message.edit(content=msg, delete_after=TEMP_MESSAGE_DURATION)
         else:  
-            set_attendance(event_name, user, status)
-            new_message = pprint_event(event_name, tz=timezone) + pprint_attendance_instructions()
+            set_attendance(event_name, user, status, collection)
+            new_message = pprint_event(event_name, collection=collection, tz=timezone) + pprint_attendance_instructions()
             await message.edit(content=new_message)
 
         await message.clear_reactions()
@@ -602,21 +550,23 @@ async def timezone(ctx, timezone):
         msg = "Set timezone for {} ({}) to {}.".format(guild_name, guild_id, new_timezone)
         await ctx.send(msg)
     else:
-        msg = "Valid timezones: {}".format(', '.join(US_TZ))
+        msg = "**Valid timezones:** \n`{}`".format(', '.join(US_TZ))
         await ctx.send(msg)
 
 
 # ==== Event Commands ====
 
-@bot.command()
+@bot.command(aliases=['s', 'sh'])
 async def show(ctx, *, name):
+    log_command(ctx)
     msg = ''
     name = name.strip('\"')
-    guild = ctx.message.guild
-    timezone = get_timezone(guild.id)
+    guild_id = ctx.message.guild.id
+    collection = get_collection(guild_id)
+    timezone = get_timezone(guild_id)
 
-    if event_exists_and_belongs_to_guild(guild.id, name):
-        msg = pprint_event(name, tz=timezone)
+    if event_exists(name, collection):
+        msg = pprint_event(name, tz=timezone, collection=collection)
         msg += pprint_attendance_instructions()
     else:
         msg = pprint_event_not_found(name)
@@ -625,38 +575,44 @@ async def show(ctx, *, name):
 
 @bot.command(aliases=["sa"])
 async def show_all(ctx):
+    log_command(ctx)
     guild_id = ctx.message.guild.id
     msg = pprint_all_events(guild_id)
     await ctx.send(msg)
 
-@bot.command(aliases=["sched"])
+@bot.command(aliases=["sched", "sch"])
 async def schedule(ctx, name, date, time, description='No description.'):
-    discord_tag = ctx.message.author.name + '#' + ctx.message.author.discriminator
-    msg = new_event(ctx, name, discord_tag, date, time, description)
+    log_command(ctx)
+    msg = new_event(ctx, name, date, time, description)
     await ctx.send(msg)
 
 @bot.command(aliases=["resched", "rs"])
 async def reschedule(ctx, name, *, datetime):
-    if not event_exists(name):
+    log_command(ctx)
+    collection = get_collection(ctx.message.guild.id)
+
+    if not event_exists(name, collection=collection):
         msg = pprint_event_not_found(name)
         await send_temp_message(ctx, msg)
     elif not (is_admin(ctx) or is_author(ctx, name)):
         msg = pprint_insufficient_privileges()
         await send_temp_message(ctx, msg)
     else:
-        event_id = name_to_id(name)
+        event_id = get_event_id(name)
         time = input_to_datetime(datetime, get_timezone(ctx.message.guild.id))
-        update_field(event_id, 'Time', time)
+        update_field(event_id, 'Time', time, collection=collection)
         msg = "Set {} to {}.".format(name, pprint_time(time))
         await ctx.send(msg)
 
 @bot.command(aliases=["unsched", "us"])
 async def unschedule(ctx, *, name):
+    log_command(ctx)
+    collection = get_collection(ctx.message.guild.id)
+
     if (is_admin(ctx) or is_author(ctx, name)):
         name = name.strip('\"')
-        event = get_event(name)
-        if event_belongs_to_guild(event, ctx.message.guild.id):
-            msg = delete_event(name)
+        event = get_event(name, collection)
+        msg = delete_event(name, collection)
         await ctx.send(msg)
     else:
         msg = pprint_insufficient_privileges()
@@ -664,6 +620,8 @@ async def unschedule(ctx, *, name):
 
 @bot.command(aliases=["usp"])
 async def unschedule_past(ctx):
+    log_command(ctx)
+
     guild = ctx.message.guild
     msg = delete_past_events(guild)
     await ctx.send(msg)
@@ -671,22 +629,26 @@ async def unschedule_past(ctx):
 # User can change value of a field which is a string.
 @bot.command()
 async def edit(ctx, name, key, value):
-    msg = ''
-    event_id = name_to_id(name)
-    event = get_event(name)
+    log_command(ctx)
+    guild_id = ctx.message.guild.id
+    collection = get_collection(guild_id)
 
-    if not event_exists(name):
+    msg = ''
+    event_id = get_event_id(name, collection)
+    event = get_event(name, collection)
+
+    if not event_exists(name, collection):
         msg += pprint_event_not_found(name) + '\n'       
 
     if (
         (key in event and not isinstance(event[key], str)) or 
         (not (is_admin(ctx) or is_author(ctx, name))) or 
-        ((key == "Author" or key == "Metadata") and not is_admin(ctx))
+        ((key in RESTRICTED) and not is_admin(ctx))
         ):
         msg += "Error: the specified field cannot be changed using this command or you do not have permission."
         await send_temp_message(ctx, msg)
     else:
-        update_field(event_id, key, value)
+        update_field(event_id, key, value, collection=collection)
         msg = "Set {} to {}.".format(key, value)
         await ctx.send(msg)
 
@@ -699,11 +661,11 @@ async def help(ctx):
     embed = discord.Embed(title=title, description="List of commands are:", color=0xeee657)
 
     embed.add_field(
-        name="!schedule [name] [date (mm/dd)] [time] [description]", 
+        name="!schedule [name] [date (mm/dd) or (today/tomorrow)] [time] [description]", 
         value='''Create a new event. 
         Use quotes if your name or description parameter has spaces in it.
         Example: `!schedule "Scrim against SHD" "Descriptive description." 3/14 1:00PM`
-        Aliases: !sched''', 
+        Aliases: `!sched, !sch`''', 
         inline=False)
 
     embed.add_field(
@@ -711,30 +673,31 @@ async def help(ctx):
         value='''Edit the time of an existing event.  
         Use quotes if your name or description parameter has spaces in it.
         Example: `!reschedule "Scrim against SHD" 4/1 13:30`
-        Aliases: !resched, !rs''', 
+        Aliases: `!resched, !rs`''', 
         inline=False)
 
     embed.add_field(
         name="!unschedule [event_name]", 
         value='''Delete the specified event entirely. Usage restricted to author of the event and admins.
-        Aliases: !unsched, !us''', 
+        Aliases: `!unsched, !us`''', 
         inline=False)
 
     embed.add_field(
         name="!unschedule_past", 
         value='''Delete ALL past events entirely.
-        Aliases: !usp''', 
+        Aliases: `!usp`''', 
         inline=False)
 
     embed.add_field(
         name="!show_all", 
         value='''Show name and time for all upcoming events.
-        Aliases: !sa''', 
+        Aliases: `!sa`''', 
         inline=False)
 
     embed.add_field(
         name="!show [event_name]", 
-        value="Show all details for the specified event.", 
+        value='''Show all details for the specified event.
+        Aliases: `!s, !sh`''', 
         inline=False)
 
     embed.add_field(
@@ -757,11 +720,12 @@ async def help(ctx):
 
 
 # ==== Undocumented Commands for Debugging/Admin ====
+'''
 @bot.command()
 async def set_attend(ctx, event_name, user_name, status):
     if is_admin(ctx):
         msg = set_attendance(event_name, user_name, status)
-        await ctx.send(msg)
+        await ctx.send(msg)'''
 
 @bot.command()
 async def factory(ctx, num_events=5):
@@ -774,16 +738,18 @@ async def factory(ctx, num_events=5):
         name = '-test' + str(num)
         msg = new_event(ctx, name, ctx.message.author.name, date, time)
         await ctx.send(msg)
-        print ("Factory creating event on date {} at time {}".format(date, time))
+        info("Factory creating event on date {} at time {}".format(date, time))
 
     await ctx.send("Attempted to create {} test events".format(num_events))
 
 @bot.command()
 async def teardown(ctx):
+    collection = get_collection(ctx.message.guild.id)
+
     cursor = EVENTS.find({})
     for event in cursor:
         if event['Name'].startswith('-test'):
-            delete_event(event['Name'])
+            delete_event(event['Name'], collection)
     await ctx.send('Deleted test events.')
 
 @bot.command()
