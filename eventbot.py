@@ -9,7 +9,7 @@ from dateparser import parse
 
 __python__ = 3.6
 __author__ = "github.com/meeow/eventbot" 
-__version__ = '2.0'
+__version__ = '2.0.2'
 
 # Files in this repo:
 # - eventbot.py (this file!)
@@ -41,7 +41,14 @@ __version__ = '2.0'
 #   - Add flag to simplify switching between local and heroku hosting
 #   - Major overhaul db logic to fix bugs when bot was used in multiple servers
 #   - Minor refactoring/cleanup
-#   - Add more command aliases for !show (!s, !sh) and !scheudle (!sch)
+#   - Add more command aliases for !show (!s, !sh) and !schedule (!sch)
+# v2.0.1 (build 248)
+#   - Underline event name when showing
+#   - Fix factory
+# v2.02 (build 249)
+#   - Fix reschedule
+# v2.03
+#   - Edit `!edit` help docs
 
 # ==== Logging config ====
 logging.basicConfig(level=logging.INFO)
@@ -356,7 +363,7 @@ def pprint_event(name, verbose=True, tz=DEFAULT_TZ, collection=EVENTS):
     for field in event:
         val = event[field]
         if field == "Name":
-            msg += "**{}**\n".format(val)
+            msg += "__**{}**__\n".format(val)
         elif field == "_id":
             msg += ''
         elif field == "Time":
@@ -388,7 +395,7 @@ def pprint_all_events(guild_id):
         found_events += pprint_event(event['Name'], tz=timezone, verbose=False, collection=collection)
 
     if not found_events:
-        msg = 'No upcoming events.'
+        msg = 'No events found.'
     else:
         msg += found_events
     return msg
@@ -522,7 +529,7 @@ async def on_raw_reaction_add(payload):
 
     if listen_to_reactions:
         status = emoji_to_status(reaction.emoji)
-        event_name = message.content.splitlines()[0].replace('*','')
+        event_name = message.content.splitlines()[0].strip('_*')
         info("{} reacted {} to {}".format(user.name, reaction, event_name))
 
         if reaction.emoji == REMINDER_EMOJI:
@@ -598,7 +605,7 @@ async def reschedule(ctx, name, *, datetime):
         msg = pprint_insufficient_privileges()
         await send_temp_message(ctx, msg)
     else:
-        event_id = get_event_id(name)
+        event_id = get_event_id(name, collection)
         time = input_to_datetime(datetime, get_timezone(ctx.message.guild.id))
         update_field(event_id, 'Time', time, collection=collection)
         msg = "Set {} to {}.".format(name, pprint_time(time))
@@ -672,6 +679,7 @@ async def help(ctx):
         name="!reschedule [name] [datetime] ", 
         value='''Edit the time of an existing event.  
         Use quotes if your name or description parameter has spaces in it.
+        Can also be used to add a new field.
         Example: `!reschedule "Scrim against SHD" 4/1 13:30`
         Aliases: `!resched, !rs`''', 
         inline=False)
@@ -733,10 +741,10 @@ async def factory(ctx, num_events=5):
         num_events = 9
 
     for num in range(num_events):
-        date = '9/{}'.format(num+1)
+        date = '10/{}'.format(num+1)
         time = str(1 + num) + ':00pm'
         name = '-test' + str(num)
-        msg = new_event(ctx, name, ctx.message.author.name, date, time)
+        msg = new_event(ctx, name, date, time)
         await ctx.send(msg)
         info("Factory creating event on date {} at time {}".format(date, time))
 
