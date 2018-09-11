@@ -9,7 +9,7 @@ from dateparser import parse
 
 __python__ = 3.6
 __author__ = "github.com/meeow/eventbot" 
-__version__ = '2.0.2'
+__version__ = '2.0.3'
 
 # Files in this repo:
 # - eventbot.py (this file!)
@@ -49,6 +49,7 @@ __version__ = '2.0.2'
 #   - Fix reschedule
 # v2.03
 #   - Edit `!edit` help docs
+#   - Fix unschedule_past
 
 # ==== Logging config ====
 logging.basicConfig(level=logging.INFO)
@@ -333,7 +334,7 @@ def delete_event(name, collection=EVENTS):
         msg = pprint_event_not_found(name)
     return msg
 
-# Guild guild: guild whose events to delete
+# int guild_id: guild id whose events to delete
 def delete_past_events(guild_id):
     msg = ''
     collection = get_collection(guild_id)
@@ -629,8 +630,8 @@ async def unschedule(ctx, *, name):
 async def unschedule_past(ctx):
     log_command(ctx)
 
-    guild = ctx.message.guild
-    msg = delete_past_events(guild)
+    guild_id = ctx.message.guild.id
+    msg = delete_past_events(guild_id)
     await ctx.send(msg)
 
 # User can change value of a field which is a string.
