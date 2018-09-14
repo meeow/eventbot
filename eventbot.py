@@ -3,13 +3,14 @@ from logging import info, warning, debug, error, critical
 from discord.ext import commands
 from pymongo import MongoClient
 from bson.codec_options import CodecOptions
+from bson.objectid import ObjectId
 from os import environ
 from pytz import timezone
 from dateparser import parse
 
 __python__ = 3.6
 __author__ = "github.com/meeow/eventbot" 
-__version__ = '2.0.3'
+__version__ = '2.1 b2'
 
 # Files in this repo:
 # - eventbot.py (this file!)
@@ -23,6 +24,7 @@ __version__ = '2.0.3'
 # - Add way to unset reminders
 # - Change customization options via discord interface (e.g. change command prefix)
 # - Unit tests
+# - Refactor link (find event by key)
 
 # Nice to have:
 # - Chronological order !show_all 
@@ -47,9 +49,17 @@ __version__ = '2.0.3'
 #   - Fix factory
 # v2.02 (build 249)
 #   - Fix reschedule
-# v2.03
+# v2.03 (build 250)
 #   - Edit `!edit` help docs
 #   - Fix unschedule_past
+# v2.04 
+#   - Fix teardown
+#   - Start to implement event linking
+# v2.1 beta (build 266)
+#   - First (incomplete) release of linking
+# v2.1 beta 2 (build 267)
+#   - Minor refactor (no more tz param in pprint_event)
+#   - Do not print author/description for linked event
 
 # ==== Logging config ====
 logging.basicConfig(level=logging.INFO)
@@ -59,7 +69,7 @@ def log_command(ctx):
 
 # ==== Database and Context Setup ====
 
-HEROKU = True
+HEROKU = 1
 
 # Heroku environment variables 
 if HEROKU:
@@ -95,6 +105,7 @@ REMINDER_CYCLE = 10
 # Interval to check for stale events, in seconds
 STALE_CHECK_CYCLE = REMINDER_CYCLE
 
+# Timezone
 DEFAULT_TZ = timezone('US/Eastern')
 VALID_TZ = set(pytz.all_timezones)
 US_TZ = set([tz for tz in pytz.all_timezones if tz.startswith('US')])
@@ -294,10 +305,10 @@ def pprint_event_not_found(name):
 # string date: date in mm/dd format 
 # string mil_time: time in 24 hr format
 # string description: descrption of event
-def new_event(ctx, name, date, time, description='No description.'):
+def new_event(ctx, name, datetime, description='No description.'):
     guild_id = ctx.message.guild.id
     collection = get_collection(guild_id)
-    time = input_to_datetime(date + ' ' + time, tz=get_timezone(guild_id))
+    time = input_to_datetime(datetime, tz=get_timezone(guild_id))
     timezone = get_timezone(guild_id)
     author = ctx.message.author.name + '#' + ctx.message.author.discriminator
 
@@ -322,7 +333,7 @@ def new_event(ctx, name, date, time, description='No description.'):
 
     collection.insert_one(event)
 
-    msg = pprint_event(name, tz=timezone, collection=collection) + pprint_attendance_instructions()
+    msg = pprint_event(name, collection=collection) + pprint_attendance_instructions()
     return msg 
 
 # string name: name of event to delete
@@ -354,46 +365,63 @@ def delete_past_events(guild_id):
 
 # string name: name of event to pretty print
 # bool verbose: print only name and time if False
-def pprint_event(name, verbose=True, tz=DEFAULT_TZ, collection=EVENTS):
+def pprint_event(name, verbose=True, collection=EVENTS):
+    tz = get_timezone(int(str(collection.name)))
+
+    def pprint_raw_event(event, opposing=False):
+        msg = ''
+        for field in event:
+            val = event[field]
+            if field == "Name":
+                msg += "__**{}**__\n".format(val)                
+            elif field == "_id":
+                msg += ''
+            elif field == "Time":
+                msg += "**{}:** {}\n".format(field, pprint_time(val, tz=tz)) 
+            elif verbose:
+                
+                if field in STATUSES and isinstance(val, list):
+                    if val:
+                        attendee_list = ', '.join(val)
+                    else:
+                        attendee_list = 'None yet!'
+                    msg += "{} **{} ({}):** {}\n".format(STATUSES[field], field, len(val), attendee_list)
+                elif opposing or field == 'Metadata':
+                    continue # do not show 
+                elif not val:
+                    msg += "**{}:** {}\n".format(field, 'None')
+                else:
+                    msg += "**{}:** {}\n".format(field, val)
+        return msg
+
     if event_exists(name, collection) == False:
         return pprint_event_not_found(name)
 
     event = get_event(name, collection)
-    msg = ''
+    msg = pprint_raw_event(event)
 
-    for field in event:
-        val = event[field]
-        if field == "Name":
-            msg += "__**{}**__\n".format(val)
-        elif field == "_id":
-            msg += ''
-        elif field == "Time":
-            msg += "**{}:** {}\n".format(field, pprint_time(val, tz=tz)) 
-        elif verbose:
-            if field == 'Metadata':
-                continue # do not show 
-            elif field in STATUSES and isinstance(val, list):
-                if val:
-                    attendee_list = ', '.join(val)
-                else:
-                    attendee_list = 'None yet!'
-                msg += "{} **{} ({}):** {}\n".format(STATUSES[field], field, len(val), attendee_list)
-            elif not val:
-                msg += "**{}:** {}\n".format(field, 'None')
-            else:
-                msg += "**{}:** {}\n".format(field, val)
+    if 'Link' in event['Metadata'] and verbose:
+        key = event['Metadata']['Link']
+        linked_event = get_linked_event(key)
+        if linked_event == None:
+            msg += "**Former linked event has been deleted.**\n"
+            msg += "**Link key:** `{} {}\n\n`".format(event['_id'], collection.name)
+        else:
+            msg += "\n**Opposing team status: **\n" + pprint_raw_event(linked_event, opposing=True)
+    elif verbose:
+        msg += "**Link key:** `{} {}\n\n`".format(event['_id'], collection.name)
+
     return msg + '\n'
 
 # Guild guild: guild to print events for
 def pprint_all_events(guild_id):
     msg = 'Showing all events. Use command `!show [event name]` for detailed info.\n\n'
     found_events = ''
-    timezone = get_timezone(guild_id)
     collection = get_collection(guild_id)
 
     cursor = collection.find({})
     for event in cursor:
-        found_events += pprint_event(event['Name'], tz=timezone, verbose=False, collection=collection)
+        found_events += pprint_event(event['Name'], verbose=False, collection=collection)
 
     if not found_events:
         msg = 'No events found.'
@@ -464,6 +492,56 @@ def delete_reminder(event, username, collection=EVENTS):
     metadata = event['Metadata']
     del metadata['Reminders'][username] 
     update_field(event_id, 'Metadata', metadata, collection)
+
+
+# ==== Helper Functions: Event Linking ====
+def set_link(event_name, key, collection):
+    if not event_exists(event_name, collection):
+        return pprint_event_not_found(event_name)
+
+    # Update first event
+    event = get_event(event_name, collection)
+    event_id = event['_id']
+
+    metadata = event['Metadata']
+    metadata['Link'] = key
+
+    update_field(event_id, 'Metadata', metadata, collection=collection)
+    print("Eventid: {}, collection: {}, key: {}, collection: {}".format(event_id, metadata, key, collection))
+
+    # Update second event
+    event2_id, guild_id = key.split()
+    key = "{} {}".format(event_id, collection.name)
+    collection = get_collection(guild_id)
+    event = collection.find_one({'_id': ObjectId(event2_id)})
+
+    metadata = event['Metadata']
+    metadata['Link'] = key
+
+    update_field(ObjectId(event2_id), 'Metadata', metadata, collection=collection)
+    print("Eventid: {}, collection: {}, key: {}, collection: {}".format(event2_id, metadata, key, collection))
+
+
+    return "Established link with key {}".format(key)
+
+def get_linked_event(key):
+    event_id, guild_id = key.split()
+    collection = get_collection(guild_id)
+    event = collection.find_one({'_id': ObjectId(event_id)})
+    return event
+
+def join_event(ctx, key):
+    event = get_linked_event(key)
+    name = event['Name']
+    datetime = event['Time']
+    description = event['Description']
+    event_new = new_event(ctx, name, str(datetime), description)
+
+    collection = get_collection(ctx.message.guild.id)
+    set_link(name, key, collection)
+
+    return pprint_event(name, collection=collection) + pprint_attendance_instructions() 
+
 
 
 # ==== Discord specific helpers ====
@@ -542,7 +620,7 @@ async def on_raw_reaction_add(payload):
             await err_message.edit(content=msg, delete_after=TEMP_MESSAGE_DURATION)
         else:  
             set_attendance(event_name, user, status, collection)
-            new_message = pprint_event(event_name, collection=collection, tz=timezone) + pprint_attendance_instructions()
+            new_message = pprint_event(event_name, collection=collection) + pprint_attendance_instructions()
             await message.edit(content=new_message)
 
         await message.clear_reactions()
@@ -574,7 +652,7 @@ async def show(ctx, *, name):
     timezone = get_timezone(guild_id)
 
     if event_exists(name, collection):
-        msg = pprint_event(name, tz=timezone, collection=collection)
+        msg = pprint_event(name, collection=collection)
         msg += pprint_attendance_instructions()
     else:
         msg = pprint_event_not_found(name)
@@ -591,7 +669,8 @@ async def show_all(ctx):
 @bot.command(aliases=["sched", "sch"])
 async def schedule(ctx, name, date, time, description='No description.'):
     log_command(ctx)
-    msg = new_event(ctx, name, date, time, description)
+    datetime = date + ' ' + time
+    msg = new_event(ctx, name, datetime, description)
     await ctx.send(msg)
 
 @bot.command(aliases=["resched", "rs"])
@@ -633,11 +712,28 @@ async def unschedule_past(ctx):
     guild_id = ctx.message.guild.id
     msg = delete_past_events(guild_id)
     await ctx.send(msg)
+'''
+@bot.command()
+async def link(ctx, event_name, *, key):
+    log_command(ctx)
+
+    collection = get_collection(ctx.message.guild.id)
+    msg = set_link(event_name, key, collection=EVENTS)
+    await ctx.send(msg)
+'''
+@bot.command()
+async def join(ctx, *, key):
+    log_command(ctx)
+
+    collection = get_collection(ctx.message.guild.id)
+    msg = join_event(ctx, key)
+    await ctx.send(msg)
 
 # User can change value of a field which is a string.
 @bot.command()
 async def edit(ctx, name, key, value):
     log_command(ctx)
+
     guild_id = ctx.message.guild.id
     collection = get_collection(guild_id)
 
@@ -661,7 +757,7 @@ async def edit(ctx, name, key, value):
         await ctx.send(msg)
 
 
-# ==== Documentation ====
+# ==== Help ====
 
 @bot.command()
 async def help(ctx):
@@ -745,7 +841,7 @@ async def factory(ctx, num_events=5):
         date = '10/{}'.format(num+1)
         time = str(1 + num) + ':00pm'
         name = '-test' + str(num)
-        msg = new_event(ctx, name, date, time)
+        msg = new_event(ctx, name, datetime)
         await ctx.send(msg)
         info("Factory creating event on date {} at time {}".format(date, time))
 
@@ -755,7 +851,7 @@ async def factory(ctx, num_events=5):
 async def teardown(ctx):
     collection = get_collection(ctx.message.guild.id)
 
-    cursor = EVENTS.find({})
+    cursor = collection.find({})
     for event in cursor:
         if event['Name'].startswith('-test'):
             delete_event(event['Name'], collection)
