@@ -10,7 +10,7 @@ from dateparser import parse
 
 __python__ = 3.6
 __author__ = "github.com/meeow/eventbot" 
-__version__ = '2.1 b2'
+__version__ = '2.2.1'
 
 # Files in this repo:
 # - eventbot.py (this file!)
@@ -53,13 +53,22 @@ __version__ = '2.1 b2'
 #   - Edit `!edit` help docs
 #   - Fix unschedule_past
 # v2.04 
-#   - Fix teardown
+#   - Fix !teardown
 #   - Start to implement event linking
 # v2.1 beta (build 266)
 #   - First (incomplete) release of linking
 # v2.1 beta 2 (build 267)
 #   - Minor refactor (no more tz param in pprint_event)
 #   - Do not print author/description for linked event
+# v2.2
+#   - Minor refactor (Remove some default params, comments)
+#   - Add id_to_name
+# v2.2.1
+#   - Add help docs for !join 
+# v2.2.2
+#   - Add more emoji options for yes and no reactions
+
+# Todo: configurable admin level
 
 # ==== Logging config ====
 logging.basicConfig(level=logging.INFO)
@@ -88,12 +97,16 @@ EVENTS = db.events.with_options(codec_options=CodecOptions(tz_aware=True))
 CONFIG = db.config.with_options(codec_options=CodecOptions(tz_aware=True))
 
 # ==== Bot default options ====
+bot = commands.Bot(command_prefix='!')
 
 # Change seconds before deleting error messages 
 TEMP_MESSAGE_DURATION = 5.0 
 
 # Add more statuses to future events simply by changing this
-STATUSES = {"Yes":"😃", "Partly":"😐", "Maybe":"🤔", "No":"😦"}
+STATUSES = {"Yes":['😃', '😀', '☺️', '😄', '😁', '🙂', '😺', '😸'], 
+            "Partly":["😐", '😑'], 
+            "Maybe":["🤔"], 
+            "No":['😦', '🙁', '☹️', '😟', '😕', '😞', '😠', '😫', '😾']}
 
 # By default, send reminders for events this number of minutes before start time
 REMINDER_TIME = 20
@@ -111,7 +124,7 @@ VALID_TZ = set(pytz.all_timezones)
 US_TZ = set([tz for tz in pytz.all_timezones if tz.startswith('US')])
 
 # Top 'x' number of roles in the server's role hierarchy allowed to perform admin commands
-ADMIN_ROLES = 1 
+DEFAULT_ADMIN_LEVEL = 1 
 # Do not allow non admins to modify these fields using !edit
 RESTRICTED = {"Author", "Metadata", "Time", "Date"}
 
@@ -151,6 +164,11 @@ def config_to_id(guild_id):
     guild_id = guild['_id']
     return guild_id
 
+# int guild_id: guild_id of guild whose name to return
+def id_to_name(guild_id):
+    guild_id = int(guild_id)
+    return bot.get_guild(guild_id)
+
 # int guild_id: guild_id of guild whose config to return
 def get_config(guild_id):
     config = CONFIG.find_one({'ID': guild_id})
@@ -168,9 +186,29 @@ def new_guild_config(guild_id):
 
 # ==== Helper Functions: Permissions ====
 
-# discord.Context ctx: context of command which calls this function
+def get_admin_level(guild_id):
+    config = get_config(guild_id)
+    if config and 'Admin' in config:
+        return int(config['Admin'])    
+    else:
+        return DEFAULT_ADMIN_LEVEL
+
+def set_admin_level(guild_id, level):
+    level = int(level)
+    if level not in range(0,30):
+        return "Invalid role level."
+    if not guild_config_exists(guild_id):
+        new_guild_config(guild_id)
+
+    config_id = config_to_id(guild_id)
+    update_field(config_id, 'Admin', level, collection=CONFIG)
+    info('Admin level set to: {} ({})'.format(level, guild_id))
+    return True
+
+# Context ctx: context of command which calls this function
 def is_admin(ctx):
-    role_index = len(ctx.message.guild.roles) - ADMIN_ROLES
+    admin_role = get_admin_level(ctx.message.guild.id)
+    role_index = len(ctx.message.guild.roles) - admin_role
     if ctx.message.author.roles[-1].position >= role_index:
         return True
     else:
@@ -254,14 +292,12 @@ def event_exists(name, collection=EVENTS):
     return bool(collection.find({"Name": name}).limit(1).count())
 
 # string name: name of event to return
-def get_event(name, collection=EVENTS):
-    if collection == EVENTS:
-        warning("Falling back to default events collection!")
+def get_event(name, collection):
     event = collection.find_one({'Name': name})
     return event
 
 # string name: name of event to find id of
-def get_event_id(name, collection=EVENTS):
+def get_event_id(name, collection):
     event = collection.find_one({'Name': name})
     event_id = event['_id']
     return event_id
@@ -281,14 +317,14 @@ def username_to_user(client, username):
 def emoji_to_status(emoji):
     matched_status = ''
     for status in STATUSES:
-        if STATUSES[status] == emoji:
+        if emoji in STATUSES[status]:
             matched_status = status
             return matched_status
 
     return matched_status
 
 def pprint_attendance_instructions():
-    msg = '```Update your status by reacting to this message with the corresponding emoji.'
+    msg = '```Update your plans by reacting to this message using the corresponding emoji.'
     msg += '\nRequest a 20 minute heads-up via DM by also reacting {}. You must be able to receive DMs from non-friends.```'.format(REMINDER_EMOJI)
     return msg
 
@@ -297,13 +333,9 @@ def pprint_event_not_found(name):
     msg = "Warning: Cannot find event called {}.".format(name)
     return msg
 
-
-# ==== Internal Logic ====
-
 # context ctx: used to get discord guild name
 # string name: name of event to create
-# string date: date in mm/dd format 
-# string mil_time: time in 24 hr format
+# string datetime: string parseable by dateparser
 # string description: descrption of event
 def new_event(ctx, name, datetime, description='No description.'):
     guild_id = ctx.message.guild.id
@@ -337,7 +369,7 @@ def new_event(ctx, name, datetime, description='No description.'):
     return msg 
 
 # string name: name of event to delete
-def delete_event(name, collection=EVENTS):
+def delete_event(name, collection):
     if event_exists(name, collection):
         result = collection.remove({"Name": name})
         msg = "Removed {}.".format(name)
@@ -365,7 +397,7 @@ def delete_past_events(guild_id):
 
 # string name: name of event to pretty print
 # bool verbose: print only name and time if False
-def pprint_event(name, verbose=True, collection=EVENTS):
+def pprint_event(name, collection, verbose=True):
     tz = get_timezone(int(str(collection.name)))
 
     def pprint_raw_event(event, opposing=False):
@@ -381,11 +413,12 @@ def pprint_event(name, verbose=True, collection=EVENTS):
             elif verbose:
                 
                 if field in STATUSES and isinstance(val, list):
+                    status = field
                     if val:
                         attendee_list = ', '.join(val)
                     else:
                         attendee_list = 'None yet!'
-                    msg += "{} **{} ({}):** {}\n".format(STATUSES[field], field, len(val), attendee_list)
+                    msg += "{} **{} ({}):** {}\n".format(STATUSES[status][0], status, len(val), attendee_list)
                 elif opposing or field == 'Metadata':
                     continue # do not show 
                 elif not val:
@@ -407,7 +440,8 @@ def pprint_event(name, verbose=True, collection=EVENTS):
             msg += "**Former linked event has been deleted.**\n"
             msg += "**Link key:** `{} {}\n\n`".format(event['_id'], collection.name)
         else:
-            msg += "\n**Opposing team status: **\n" + pprint_raw_event(linked_event, opposing=True)
+            msg += "\n**Opposing team ({}) status: **\n".format(id_to_name(key[key.find(' ')+1:])) 
+            msg += pprint_raw_event(linked_event, opposing=True)
     elif verbose:
         msg += "**Link key:** `{} {}\n\n`".format(event['_id'], collection.name)
 
@@ -507,7 +541,6 @@ def set_link(event_name, key, collection):
     metadata['Link'] = key
 
     update_field(event_id, 'Metadata', metadata, collection=collection)
-    print("Eventid: {}, collection: {}, key: {}, collection: {}".format(event_id, metadata, key, collection))
 
     # Update second event
     event2_id, guild_id = key.split()
@@ -519,8 +552,6 @@ def set_link(event_name, key, collection):
     metadata['Link'] = key
 
     update_field(ObjectId(event2_id), 'Metadata', metadata, collection=collection)
-    print("Eventid: {}, collection: {}, key: {}, collection: {}".format(event2_id, metadata, key, collection))
-
 
     return "Established link with key {}".format(key)
 
@@ -543,7 +574,6 @@ def join_event(ctx, key):
     return pprint_event(name, collection=collection) + pprint_attendance_instructions() 
 
 
-
 # ==== Discord specific helpers ====
 async def send_temp_message(ctx, msg):
     temp_msg = await ctx.send(msg)
@@ -552,7 +582,6 @@ async def send_temp_message(ctx, msg):
 
 # ==== Bot init ====
 
-bot = commands.Bot(command_prefix='!')
 
 # Remove default help command
 bot.remove_command('help')
@@ -819,6 +848,15 @@ async def help(ctx):
         US/Eastern
         US/Central
         US/Pacific''', 
+        inline=False)
+
+    embed.add_field(
+        name="!join [link_key]", 
+        value='''Create a linked duplicate event in another server (that has this bot).
+        Linked events will display the attendance status of both teams.
+        Link key is automatically displayed when scheduling an event. 
+        Send the link key to the other team so they can run this command.
+        ''', 
         inline=False)
 
     await ctx.send(embed=embed)
