@@ -1,6 +1,8 @@
 # eventbot
 Discord bot to streamline the organization of events for the members of a server.
 
+This is no longer necessary since Discord added server events
+
 # Past version history:
 ## v1.1
    * Add unschedule_past command
